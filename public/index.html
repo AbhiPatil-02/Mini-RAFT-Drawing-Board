@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mini-RAFT Drawing Board</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- ── Header ── -->
+    <header id="header">
+      <h1>🎨 Mini-RAFT Drawing Board</h1>
+      <div id="raft-badge" class="badge follower">
+        <span id="badge-icon">🔵</span>
+        <span id="badge-text">Connecting…</span>
+      </div>
+    </header>
+
+    <!-- ── Main layout ── -->
+    <div id="main">
+      <!-- ── Toolbar ── -->
+      <aside id="toolbar">
+        <section class="tool-group">
+          <label>Tool</label>
+          <button id="btn-pen"    class="tool-btn active" title="Pen">✏️</button>
+          <button id="btn-eraser" class="tool-btn"        title="Eraser">🧹</button>
+        </section>
+
+        <section class="tool-group">
+          <label>Colour</label>
+          <div id="color-swatches">
+            <button class="swatch active" data-color="#1a1a2e" style="background:#1a1a2e;"></button>
+            <button class="swatch"        data-color="#e63946" style="background:#e63946;"></button>
+            <button class="swatch"        data-color="#457b9d" style="background:#457b9d;"></button>
+            <button class="swatch"        data-color="#2a9d8f" style="background:#2a9d8f;"></button>
+            <button class="swatch"        data-color="#e9c46a" style="background:#e9c46a;"></button>
+            <button class="swatch"        data-color="#f4a261" style="background:#f4a261;"></button>
+            <button class="swatch"        data-color="#8338ec" style="background:#8338ec;"></button>
+            <button class="swatch"        data-color="#ffffff" style="background:#ffffff; border:1px solid #ccc;"></button>
+          </div>
+          <input type="color" id="custom-color" title="Custom colour" value="#1a1a2e" />
+        </section>
+
+        <section class="tool-group">
+          <label>Size – <span id="size-label">4</span>px</label>
+          <input type="range" id="size-slider" min="1" max="40" value="4" />
+        </section>
+
+        <section class="tool-group">
+          <button id="btn-clear" class="action-btn">🗑 Clear canvas</button>
+        </section>
+
+        <!-- ── RAFT status panel ── -->
+        <section class="tool-group raft-panel" id="raft-panel">
+          <label>RAFT Status</label>
+          <div class="raft-row"><span class="raft-key">Node ID</span>  <span id="r-id">–</span></div>
+          <div class="raft-row"><span class="raft-key">State</span>    <span id="r-state">–</span></div>
+          <div class="raft-row"><span class="raft-key">Term</span>     <span id="r-term">–</span></div>
+          <div class="raft-row"><span class="raft-key">Leader</span>   <span id="r-leader">–</span></div>
+          <div class="raft-row"><span class="raft-key">Log</span>      <span id="r-log">0</span> entries</div>
+          <div class="raft-row"><span class="raft-key">Committed</span><span id="r-commit">-1</span></div>
+        </section>
+      </aside>
+
+      <!-- ── Canvas ── -->
+      <div id="canvas-container">
+        <canvas id="board"></canvas>
+        <div id="overlay-msg" class="hidden">Waiting for leader…</div>
+      </div>
+    </div>
+
+    <!-- ── Toast notifications ── -->
+    <div id="toast-container"></div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
