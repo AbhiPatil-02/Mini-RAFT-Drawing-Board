@@ -14,6 +14,7 @@
 > **Related Documents:**
 > - `SRS_Document.md` — Functional/non-functional requirements, API specs, protocol specification, and data models
 > - `architecture_diagram.md` — Standalone architecture diagrams (cluster layout, state machine, sequence diagrams)
+> - `Week2_Implementation_Progress.md` — Detailed record of all Week 2 changes, design decisions, and verified live cluster state
 
 ---
 
@@ -343,11 +344,14 @@ docker-compose down
 | 14    | **Week 2 Review** — full integration test with 2 browser tabs                       | All             | End-to-end drawing works                  |
 
 **Week 2 Acceptance Criteria:**
-- [ ] Leader election works — kill leader → new election → new leader within 2 s
-- [ ] Strokes replicated to majority before commit
-- [ ] End-to-end: draw in Tab A → appears in Tab B
-- [ ] Gateway correctly re-routes on leader change
-- [ ] All election/commit events visible in `docker logs`
+- [x] Leader election works — kill leader → new election → new leader within 2 s
+- [x] Strokes replicated to majority before commit (`handleClientStroke` majority-ACK pipeline)
+- [x] End-to-end: draw in Tab A → appears in Tab B (Gateway `/broadcast` → WebSocket push)
+- [x] Gateway correctly re-routes on leader change (leaderTracker discovery + stroke queue replay)
+- [x] All election/commit events visible in `docker logs`
+
+> ✅ **Week 2 Complete** — All 5 containers run, `replica1` elected Leader in Term 1 on startup.
+> Full implementation details: [`Week2_Implementation_Progress.md`](./Week2_Implementation_Progress.md)
 
 ---
 

@@ -13,4 +13,5 @@ RUN npm install -g nodemon
 
 EXPOSE 4001
 
-CMD ["nodemon", "--watch", ".", "--ext", "js,json", "server.js"]
+# nodemon reads watch config from nodemon.json
+CMD ["nodemon"]

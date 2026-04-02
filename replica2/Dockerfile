@@ -11,6 +11,7 @@ COPY . .
 # Install nodemon globally for hot-reload via bind mount
 RUN npm install -g nodemon
 
-EXPOSE 4001
+EXPOSE 4002
 
-CMD ["nodemon", "--watch", ".", "--ext", "js,json", "server.js"]
+# nodemon reads watch config from nodemon.json
+CMD ["nodemon"]

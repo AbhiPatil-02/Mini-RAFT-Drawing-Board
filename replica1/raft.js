@@ -29,8 +29,9 @@ let votedFor      = null;        // replicaId string or null
 let commitIndex   = 0;
 let currentLeader = null;
 
-let electionTimer  = null;
-let heartbeatTimer = null;
+let electionTimer      = null;
+let heartbeatTimer     = null;
+let electionInProgress = false; // Guard against re-entrant election calls
 
 // ── Cluster constants ─────────────────────────────────────────────────────────
 // Total nodes = self + peers (3 for standard setup)
@@ -118,10 +119,12 @@ function becomeLeader() {
  */
 async function startElection() {
   if (state === 'Leader') return; // Safety guard
+  if (electionInProgress) return; // Prevent re-entrant elections
 
+  electionInProgress = true;
   becomeCandidate();
 
-  let votes      = 1; // Self-vote already recorded in becomeCandidate()
+  let votes       = 1; // Self-vote already recorded in becomeCandidate()
   let steppedDown = false;
 
   console.log(`[RAFT][${config.REPLICA_ID}] Requesting votes from ${config.PEERS.length} peer(s)...`);
@@ -155,6 +158,7 @@ async function startElection() {
   });
 
   await Promise.allSettled(voteRequests);
+  electionInProgress = false;
 
   // Re-check — could have stepped down during RPC round-trips
   if (steppedDown || state !== 'Candidate') return;
@@ -565,7 +569,14 @@ function start() {
   console.log(`[RAFT][${config.REPLICA_ID}]    Election TO : ${config.ELECTION_TIMEOUT_MIN_MS}–${config.ELECTION_TIMEOUT_MAX_MS} ms`);
   console.log(`[RAFT][${config.REPLICA_ID}]    Heartbeat   : every ${config.HEARTBEAT_INTERVAL_MS} ms`);
   console.log(`[RAFT][${config.REPLICA_ID}] ──────────────────────────────────────────────────`);
-  becomeFollower(0);
+
+  // Add a small startup jitter based on the replica ID digit so all three nodes
+  // don't fire their first election at exactly the same moment on Docker startup.
+  // replica1 → +0 ms, replica2 → +50 ms, replica3 → +100 ms (well within timeout window)
+  const idDigit   = parseInt(config.REPLICA_ID.replace(/\D/g, ''), 10) || 1;
+  const jitter    = (idDigit - 1) * 50;
+  console.log(`[RAFT][${config.REPLICA_ID}] Applying startup jitter: ${jitter} ms`);
+  setTimeout(() => becomeFollower(0), jitter);
 }
 
 /**
