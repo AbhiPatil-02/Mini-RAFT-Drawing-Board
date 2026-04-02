@@ -11,7 +11,9 @@
 | **Duration**      | 3 Weeks                                                      |
 | **Architecture**  | Microservices (Containerised via Docker)                     |
 
-> **Related Document:** See `SRS_Document.md` for functional/non-functional requirements, API specs, protocol specification, and data models.
+> **Related Documents:**
+> - `SRS_Document.md` — Functional/non-functional requirements, API specs, protocol specification, and data models
+> - `architecture_diagram.md` — Standalone architecture diagrams (cluster layout, state machine, sequence diagrams)
 
 ---
 
@@ -316,7 +318,7 @@ docker-compose down
 | 7     | **Week 1 Review** — run `docker-compose up --build`, verify all 5 containers start | All | All containers healthy             |
 
 **Week 1 Acceptance Criteria:**
-- [ ] Architecture diagram complete
+- [x] Architecture diagram complete (`documentation/architecture_diagram.md`)
 - [ ] All API endpoints documented and agreed
 - [ ] RAFT state machine design documented
 - [ ] `docker-compose up` starts all 5 services without errors
