@@ -4,13 +4,12 @@
  * Responsibilities:
  *  - Maintain an in-memory append-only array of log entries
  *  - Each entry: { index, term, stroke, committed }
- *  - Provide helpers: append, getEntry, lastIndex, lastTerm, getFrom, commit
+ *  - Provide helpers: append, getEntry, lastIndex, lastTerm, getFrom, commit,
+ *                     truncateFrom, getCommitted
  *
- * Safety Rules (from RAFT spec):
- *  - Committed entries are NEVER overwritten
+ * RAFT Safety Rules:
+ *  - Committed entries are NEVER overwritten (truncateFrom guards this)
  *  - Log index is 1-based
- *
- * TODO (Week 2): Implement all methods below
  */
 
 class StrokeLog {
@@ -53,6 +52,7 @@ class StrokeLog {
    * Used by /sync-log to send missing entries to a restarted follower.
    */
   getFrom(startIndex) {
+    if (startIndex < 1) return [...this.entries];
     return this.entries.slice(startIndex - 1);
   }
 
@@ -61,6 +61,24 @@ class StrokeLog {
     const entry = this.getEntry(index);
     if (entry) {
       entry.committed = true;
+    }
+  }
+
+  /**
+   * Truncate all entries from startIndex (1-based) onward.
+   * Only removes UNCOMMITTED entries — committed entries are never removed.
+   * Called when a follower detects a log conflict with the leader.
+   */
+  truncateFrom(startIndex) {
+    // Find the highest committed index to protect
+    const lastCommitted = this.entries.reduce((max, e) => {
+      return e.committed ? Math.max(max, e.index) : max;
+    }, 0);
+
+    // Never truncate committed entries
+    const safeStart = Math.max(startIndex, lastCommitted + 1);
+    if (safeStart <= this.entries.length) {
+      this.entries = this.entries.slice(0, safeStart - 1);
     }
   }
 
@@ -76,3 +94,4 @@ class StrokeLog {
 }
 
 module.exports = new StrokeLog();
+
