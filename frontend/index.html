@@ -4,17 +4,85 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mini-RAFT Drawing Board</title>
+  <meta name="description" content="Distributed real-time collaborative drawing board powered by Mini-RAFT consensus." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <h1>Mini-RAFT Drawing Board</h1>
-    <div id="status-indicator" class="status disconnected">Connecting...</div>
+
+  <!-- ── Header ──────────────────────────────────────────────────────────── -->
+  <header id="app-header">
+    <div class="header-left">
+      <div class="logo">
+        <span class="logo-icon">◈</span>
+        <h1>Mini-RAFT Drawing Board</h1>
+      </div>
+      <div class="header-meta" id="leader-badge" title="Current RAFT leader">
+        <span class="meta-label">Leader</span>
+        <span class="meta-value" id="leader-name">–</span>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <!-- Toolbar -->
+      <div class="toolbar" role="toolbar" aria-label="Drawing tools">
+
+        <!-- Colour palette -->
+        <div class="tool-group" id="colour-group">
+          <button class="colour-btn active" data-colour="#1e1e2e" style="--c:#1e1e2e" title="Black" id="btn-colour-black"></button>
+          <button class="colour-btn" data-colour="#e94560"  style="--c:#e94560" title="Red"   id="btn-colour-red"></button>
+          <button class="colour-btn" data-colour="#4ade80"  style="--c:#4ade80" title="Green" id="btn-colour-green"></button>
+          <button class="colour-btn" data-colour="#60a5fa"  style="--c:#60a5fa" title="Blue"  id="btn-colour-blue"></button>
+          <button class="colour-btn" data-colour="#fbbf24"  style="--c:#fbbf24" title="Yellow" id="btn-colour-yellow"></button>
+          <button class="colour-btn" data-colour="#a78bfa"  style="--c:#a78bfa" title="Purple" id="btn-colour-purple"></button>
+          <button class="colour-btn" data-colour="#f97316"  style="--c:#f97316" title="Orange" id="btn-colour-orange"></button>
+          <button class="colour-btn eraser-swatch" data-colour="eraser" style="--c:#ffffff" title="Eraser" id="btn-eraser">✕</button>
+        </div>
+
+        <div class="tool-divider"></div>
+
+        <!-- Brush size -->
+        <div class="tool-group brush-group">
+          <label class="meta-label" for="brush-size">Size</label>
+          <input type="range" id="brush-size" min="2" max="32" value="4" step="1" title="Brush size" />
+          <span class="brush-preview" id="brush-preview"></span>
+        </div>
+
+        <div class="tool-divider"></div>
+
+        <!-- Actions -->
+        <button class="action-btn" id="btn-clear" title="Clear canvas (local only)">Clear</button>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="connection-info">
+        <div id="status-indicator" class="status disconnected" aria-live="polite">Connecting…</div>
+        <div class="client-count" id="client-count" title="Connected users">
+          <span class="count-icon">👥</span>
+          <span id="count-value">–</span>
+        </div>
+      </div>
+    </div>
   </header>
 
-  <main>
-    <canvas id="drawing-canvas"></canvas>
+  <!-- ── Canvas ───────────────────────────────────────────────────────────── -->
+  <main id="canvas-container">
+    <canvas id="drawing-canvas" aria-label="Collaborative drawing canvas"></canvas>
+
+    <!-- Overlay shown when disconnected -->
+    <div class="canvas-overlay" id="canvas-overlay" aria-hidden="true">
+      <div class="overlay-content">
+        <div class="overlay-spinner"></div>
+        <p id="overlay-message">Connecting to server…</p>
+      </div>
+    </div>
   </main>
+
+  <!-- ── Toast notifications ──────────────────────────────────────────────── -->
+  <div id="toast-container" aria-live="assertive"></div>
 
   <script src="app.js"></script>
 </body>
