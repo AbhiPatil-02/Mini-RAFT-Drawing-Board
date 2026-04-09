@@ -18,9 +18,6 @@ services:
     build: ./gateway
     ports:
       - "3000:3000"
-    volumes:
-      - ./gateway:/app          # Bind mount for hot-reload
-      - /app/node_modules        # Preserve node_modules inside container
     environment:
       - REPLICAS=replica1:4001,replica2:4002,replica3:4003
     networks:
