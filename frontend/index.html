@@ -84,10 +84,11 @@
     <canvas id="drawing-canvas" aria-label="Collaborative drawing canvas"></canvas>
 
     <!-- Overlay shown when disconnected -->
-    <div class="canvas-overlay" id="canvas-overlay" aria-hidden="true">
+    <div class="canvas-overlay" id="canvas-overlay" aria-hidden="false">
       <div class="overlay-content">
         <div class="overlay-spinner"></div>
         <p id="overlay-message">Connecting to server…</p>
+        <p id="overlay-sub" class="overlay-sub"></p>
       </div>
     </div>
   </main>
