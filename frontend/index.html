@@ -1,15 +1,18 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mini-RAFT Drawing Board</title>
-  <meta name="description" content="Distributed real-time collaborative drawing board powered by Mini-RAFT consensus." />
+  <meta name="description"
+    content="Distributed real-time collaborative drawing board powered by Mini-RAFT consensus." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
 </head>
+
 <body>
 
   <!-- ── Header ──────────────────────────────────────────────────────────── -->
@@ -31,14 +34,21 @@
 
         <!-- Colour palette -->
         <div class="tool-group" id="colour-group">
-          <button class="colour-btn active" data-colour="#1e1e2e" style="--c:#1e1e2e" title="Black" id="btn-colour-black"></button>
-          <button class="colour-btn" data-colour="#e94560"  style="--c:#e94560" title="Red"   id="btn-colour-red"></button>
-          <button class="colour-btn" data-colour="#4ade80"  style="--c:#4ade80" title="Green" id="btn-colour-green"></button>
-          <button class="colour-btn" data-colour="#60a5fa"  style="--c:#60a5fa" title="Blue"  id="btn-colour-blue"></button>
-          <button class="colour-btn" data-colour="#fbbf24"  style="--c:#fbbf24" title="Yellow" id="btn-colour-yellow"></button>
-          <button class="colour-btn" data-colour="#a78bfa"  style="--c:#a78bfa" title="Purple" id="btn-colour-purple"></button>
-          <button class="colour-btn" data-colour="#f97316"  style="--c:#f97316" title="Orange" id="btn-colour-orange"></button>
-          <button class="colour-btn eraser-swatch" data-colour="eraser" style="--c:#ffffff" title="Eraser" id="btn-eraser">✕</button>
+          <button class="colour-btn active" data-colour="#1e1e2e" style="--c:#1e1e2e" title="Black"
+            id="btn-colour-black"></button>
+          <button class="colour-btn" data-colour="#e94560" style="--c:#e94560" title="Red" id="btn-colour-red"></button>
+          <button class="colour-btn" data-colour="#4ade80" style="--c:#4ade80" title="Green"
+            id="btn-colour-green"></button>
+          <button class="colour-btn" data-colour="#60a5fa" style="--c:#60a5fa" title="Blue"
+            id="btn-colour-blue"></button>
+          <button class="colour-btn" data-colour="#fbbf24" style="--c:#fbbf24" title="Yellow"
+            id="btn-colour-yellow"></button>
+          <button class="colour-btn" data-colour="#a78bfa" style="--c:#a78bfa" title="Purple"
+            id="btn-colour-purple"></button>
+          <button class="colour-btn" data-colour="#f97316" style="--c:#f97316" title="Orange"
+            id="btn-colour-orange"></button>
+          <button class="colour-btn eraser-swatch" data-colour="eraser" style="--c:#ffffff" title="Eraser"
+            id="btn-eraser">✕</button>
         </div>
 
         <div class="tool-divider"></div>
@@ -59,6 +69,7 @@
 
     <div class="header-right">
       <div class="connection-info">
+        <span id="queue-depth" class="queue-badge hidden" title="Strokes queued (leader unavailable)"></span>
         <div id="status-indicator" class="status disconnected" aria-live="polite">Connecting…</div>
         <div class="client-count" id="client-count" title="Connected users">
           <span class="count-icon">👥</span>
@@ -86,4 +97,5 @@
 
   <script src="app.js"></script>
 </body>
+
 </html>

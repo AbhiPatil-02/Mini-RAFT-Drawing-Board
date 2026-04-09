@@ -68,34 +68,33 @@ function broadcast(payload) {
 }
 
 // ── Full-sync helper ──────────────────────────────────────────────────────────
+const axios = require('axios');
+
 /**
  * Ask the leader for its committed log and send it to a newly connected client.
- * If the leader is unavailable or the log is empty, sends an empty full-sync
- * so the client knows it's connected and can start drawing.
+ *
+ * Goes directly to GET /committed-log on the known leader — no pre-flight /status
+ * call needed (leaderTracker already guarantees the URL is a current Leader).
+ * Sends an empty full-sync on any failure so the client can still start drawing.
  */
 async function sendFullSync(ws) {
+  const leaderUrl = leaderTracker.getLeader();
+
+  if (!leaderUrl) {
+    // No leader yet known — send empty sync; client will receive strokes
+    // via broadcast once the tracker finds a leader.
+    sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
+    console.log(`[Gateway] Full-sync: no leader yet — sent empty sync to client ${ws.id}`);
+    return;
+  }
+
   try {
-    const leaderUrl = leaderTracker.getLeader();
-    if (!leaderUrl) {
-      // No leader yet — send empty sync so client knows it's connected
-      sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-      return;
-    }
-
-    const axios = require('axios');
-    const res   = await axios.get(`${leaderUrl}/status`, { timeout: 1000 });
-
-    // We use the leader's committed log entries which are held in memory.
-    // The /status endpoint tells us how many are committed; we fetch them
-    // via a dedicated /log endpoint the leader exposes (added in server.js).
-    // For now we call /committed-log — handled by replica server.js.
-    const logRes = await axios.get(`${leaderUrl}/committed-log`, { timeout: 2000 });
+    const logRes  = await axios.get(`${leaderUrl}/committed-log`, { timeout: 2000 });
     const strokes = logRes.data.strokes || [];
-
     sendToClient(ws, { type: 'full-sync', data: { strokes } });
-    console.log(`[Gateway] Full-sync sent to client ${ws.id} — ${strokes.length} stroke(s)`);
+    console.log(`[Gateway] Full-sync → client ${ws.id}: ${strokes.length} stroke(s) from ${leaderUrl}`);
   } catch (err) {
-    // Leader unreachable or /committed-log not yet available — send empty sync
+    // Leader unreachable or /committed-log not yet available — degrade gracefully
     console.warn(`[Gateway] Full-sync failed for client ${ws.id}: ${err.message}`);
     sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
   }
@@ -191,26 +190,41 @@ app.post('/broadcast', (req, res) => {
 // ── HTTP: Health / Status ─────────────────────────────────────────────────────
 /**
  * GET /health
- * Returns gateway liveness and the currently tracked leader URL.
- * Shape: { status: "ok", leader: "<url>", clients: <count> }
+ * Returns gateway liveness, the currently tracked leader URL, connected
+ * client count, and pending stroke queue depth.
+ * Shape: { status, leader, clients, queueDepth }
  */
 app.get('/health', (req, res) => {
+  const stats = leaderTracker.getStats();
   res.json({
-    status:  'ok',
-    leader:  leaderTracker.getLeader(),
-    clients: clients.size,
+    status:     'ok',
+    leader:     stats.leader,
+    clients:    clients.size,
+    queueDepth: stats.queueDepth,
   });
 });
 
 app.get('/status', (req, res) => {
+  const stats = leaderTracker.getStats();
   res.json({
-    status:  'ok',
-    leader:  leaderTracker.getLeader(),
-    clients: clients.size,
+    status:     'ok',
+    leader:     stats.leader,
+    clients:    clients.size,
+    queueDepth: stats.queueDepth,
   });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
+
+// Log every leader transition detected by the tracker
+leaderTracker.onLeaderChange((newLeader, prevLeader) => {
+  if (newLeader) {
+    console.log(`[Gateway] Leader changed: ${prevLeader || 'none'} → ${newLeader}`);
+  } else {
+    console.warn(`[Gateway] Leader lost (was ${prevLeader}) — strokes will be queued`);
+  }
+});
+
 server.listen(PORT, () => {
   console.log(`[Gateway] ── WebSocket Gateway starting ────────────────────────`);
   console.log(`[Gateway]    HTTP + WS port : ${PORT}`);
