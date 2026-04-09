@@ -332,6 +332,29 @@ function handleMessage(msg) {
       showToast(msg.data?.message || 'Server error', 'error');
       break;
 
+    /**
+     * Graceful failover messages (FR-GW-07 / FR-GW-08)
+     *
+     * These are pushed by the Gateway when leaderTracker detects a leader
+     * transition.  The WebSocket connection is NEVER closed — we only update
+     * the status indicator and show a transient toast so the user knows
+     * their strokes are safely queued.
+     */
+    case 'leader-changing':
+      // Leader is down — election in progress, strokes are queued gateway-side
+      console.warn('[WS] Leader changing — election in progress');
+      setFailoverIndicator(true);
+      showToast('Leader election in progress — strokes are safely queued ⏳', 'warn', 5000);
+      break;
+
+    case 'leader-restored':
+      // New leader elected, queue drained — system is back to full health
+      console.log('[WS] Leader restored:', msg.data?.leader);
+      setFailoverIndicator(false);
+      updateLeaderBadge(msg.data?.leader || null);
+      showToast('New leader elected — drawing resumed ✅', 'success', 3000);
+      break;
+
     default:
       console.warn('[WS] Unknown message type:', msg.type);
   }
@@ -367,6 +390,35 @@ function stopPing() {
 function setStatus(cssClass, text) {
   statusEl.className = `status ${cssClass}`;
   statusEl.textContent = text;
+}
+
+/**
+ * Show or hide the failover indicator.
+ *
+ * When isActive=true the status pill switches to a pulsing "Electing…" state
+ * (reusing the existing .reconnecting CSS class so no new styles are needed).
+ * When isActive=false, it reverts to "Connected" — keeping the WS intact.
+ *
+ * The overlay is intentionally NOT shown: the canvas stays usable so the user
+ * can keep drawing (strokes are queued and will be replayed automatically).
+ */
+function setFailoverIndicator(isActive) {
+  if (isActive) {
+    // Show pulsing yellow pill — don't show the full canvas overlay
+    setStatus('reconnecting', 'Electing…');
+    if (queueDepthEl) {
+      queueDepthEl.textContent = 'queued';
+      queueDepthEl.classList.remove('hidden');
+    }
+  } else {
+    // Only restore 'connected' if the WS is actually still open
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      setStatus('connected', 'Connected');
+    }
+    if (queueDepthEl) {
+      queueDepthEl.classList.add('hidden');
+    }
+  }
 }
 
 function showOverlay(message) {
@@ -423,10 +475,24 @@ function startHealthPolling() {
       const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(2000) });
       const data = await res.json();
 
-      updateLeaderBadge(data.leader);
+      // Update leader badge (unless failover is in progress — badge will
+      // be updated from the leader-restored WS message instead)
+      if (!data.failoverActive) {
+        updateLeaderBadge(data.leader);
+      }
 
       if (data.clients !== undefined) {
         countValueEl.textContent = data.clients;
+      }
+
+      // Keep failover indicator in sync with gateway state (catches cases
+      // where the WS 'leader-changing' message arrived before we were ready)
+      if (data.failoverActive) {
+        setFailoverIndicator(true);
+      } else if (statusEl.classList.contains('reconnecting') && ws && ws.readyState === WebSocket.OPEN) {
+        // Failover ended but we might have missed the leader-restored WS message
+        setFailoverIndicator(false);
+        updateLeaderBadge(data.leader);
       }
 
       // Show queue depth badge — hidden when queue is empty
@@ -435,7 +501,7 @@ function startHealthPolling() {
         if (depth > 0) {
           queueDepthEl.textContent = `${depth} queued`;
           queueDepthEl.classList.remove('hidden');
-        } else {
+        } else if (!data.failoverActive) {
           queueDepthEl.classList.add('hidden');
         }
       }
