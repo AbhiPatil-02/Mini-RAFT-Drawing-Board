@@ -23,11 +23,11 @@ const WsTestClient = require('../helpers/wsClient');
 // ─── Endpoints ────────────────────────────────────────────────────────────────
 
 const BASE = {
-  r1: 'http://localhost:4001',
-  r2: 'http://localhost:4002',
-  r3: 'http://localhost:4003',
-  gw: 'http://localhost:3000',
-  ws: 'ws://localhost:3000',
+  r1: 'http://127.0.0.1:4001',
+  r2: 'http://127.0.0.1:4002',
+  r3: 'http://127.0.0.1:4003',
+  gw: 'http://127.0.0.1:3000',
+  ws: 'ws://127.0.0.1:3000',
 };
 
 // Docker container names (compose project = directory name, lowercased + stripped)
@@ -429,7 +429,7 @@ describe('[IT-5] Catch-up on restart', () => {
       // 3. Draw 5 strokes to the leader while follower is down
       for (let i = 0; i < 5; i++) {
         await axios.post(
-          `http://localhost:${leaderPort}/client-stroke`,
+          `http://127.0.0.1:${leaderPort}/client-stroke`,
           { stroke: mkStroke(`color-${i}`) },
           { timeout: 3000 }
         );
@@ -437,7 +437,7 @@ describe('[IT-5] Catch-up on restart', () => {
 
       // Verify leader has 5+ new entries
       const midLeader = await axios.get(
-        `http://localhost:${leaderPort}/status`,
+        `http://127.0.0.1:${leaderPort}/status`,
         { timeout: 2000 }
       );
       const targetLogLength = midLeader.data.logLength;
@@ -465,3 +465,116 @@ describe('[IT-5] Catch-up on restart', () => {
     40_000
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IT-6: Reconnect + Full-Sync — disconnected client sees complete canvas
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('[IT-6] Reconnect + Full-Sync', () => {
+  let tabA, tabB;
+
+  afterEach(async () => {
+    if (tabA) { tabA.close(); tabA = null; }
+    if (tabB) { tabB.close(); tabB = null; }
+  });
+
+  it_cluster(
+    'reconnected client receives full-sync with all strokes drawn while it was gone',
+    async () => {
+      // 1. Tab A connects and receives initial full-sync
+      tabA = await WsTestClient.connect(BASE.ws);
+      const syncA = await tabA.waitForType('full-sync', 5000);
+      const baselineCount = syncA.data.strokes.length;
+
+      // 2. Deliberately disconnect Tab A
+      tabA.close();
+      tabA = null;
+      await sleep(300); // let the gateway process the disconnect
+
+      // 3. While Tab A is disconnected, draw 3 strokes via Tab B
+      tabB = await WsTestClient.connect(BASE.ws);
+      await tabB.waitForType('full-sync', 5000);
+
+      const colors = ['reconnect-red', 'reconnect-green', 'reconnect-blue'];
+      for (const color of colors) {
+        const committed = tabB.expectStrokeCommitted(6000);
+        tabB.send({ type: 'stroke', data: mkStroke(color) });
+        await committed; // wait until each stroke is raft-committed before sending next
+      }
+
+      // 4. Tab A reconnects (simulating browser reconnect after drop)
+      tabA = await WsTestClient.connect(BASE.ws);
+
+      // 5. Immediately upon reconnect, Tab A should receive full-sync
+      const syncAfter = await tabA.waitForType('full-sync', 6000);
+
+      // 6. Full-sync must contain all strokes drawn while Tab A was away
+      expect(syncAfter.type).toBe('full-sync');
+      expect(syncAfter.data.strokes.length).toBeGreaterThanOrEqual(baselineCount + 3);
+
+      for (const color of colors) {
+        const found = syncAfter.data.strokes.some(s => s.color === color);
+        expect(found).toBe(true);
+      }
+    },
+    30_000
+  );
+
+  it_cluster(
+    'full-sync strokes have monotonically increasing indices (no gaps, no duplicates)',
+    async () => {
+      tabA = await WsTestClient.connect(BASE.ws);
+      const sync = await tabA.waitForType('full-sync', 5000);
+
+      const strokes = sync.data.strokes;
+      if (strokes.length < 2) return; // Not enough data to check ordering
+
+      // Indices must be strictly increasing
+      for (let i = 1; i < strokes.length; i++) {
+        expect(strokes[i].index).toBeGreaterThan(strokes[i - 1].index);
+      }
+
+      // No duplicate indices
+      const indexSet = new Set(strokes.map(s => s.index));
+      expect(indexSet.size).toBe(strokes.length);
+    },
+    10_000
+  );
+
+  it_cluster(
+    'stroke-committed messages received before full-sync are not duplicated in canvas',
+    async () => {
+      /**
+       * This tests the race window: a stroke may be broadcast by the leader
+       * between WS open and full-sync delivery.  The frontend buffers these
+       * broadcasts and merges them idempotently into the full-sync payload.
+       *
+       * From the test harness we verify: if Tab B draws immediately after Tab A
+       * connects (before Tab A's full-sync arrives), Tab A's full-sync should
+       * still contain that stroke exactly once.
+       */
+      tabB = await WsTestClient.connect(BASE.ws);
+      await tabB.waitForType('full-sync', 5000);
+
+      // Connect Tab A — but DON'T wait for its full-sync yet
+      tabA = await WsTestClient.connect(BASE.ws);
+
+      // Tab B draws a stroke immediately (race window)
+      const committed = tabB.expectStrokeCommitted(6000);
+      tabB.send({ type: 'stroke', data: mkStroke('race-window-purple') });
+      await committed;
+
+      // Now wait for Tab A's full-sync
+      const syncA = await tabA.waitForType('full-sync', 6000);
+
+      // The race-window stroke must appear in the sync — exactly once
+      const raceStrokes = syncA.data.strokes.filter(s => s.color === 'race-window-purple');
+      expect(raceStrokes.length).toBeGreaterThanOrEqual(1); // at least one
+      // No duplicates
+      const raceIndices = raceStrokes.map(s => s.index);
+      expect(new Set(raceIndices).size).toBe(raceIndices.length);
+    },
+    20_000
+  );
+});
+

@@ -79,15 +79,23 @@ function exec(cmd) {
 
 /**
  * Returns true if the cluster (at least replica1) is reachable.
+ * Polls for up to 15 seconds to allow Docker containers time to boot.
  */
 async function isClusterUp(axios, BASE) {
-  try {
-    await axios.get(`${BASE.r1}/status`, { timeout: 4000 });
-    return true;
-  } catch (err) {
-    console.warn(`[isClusterUp] Could not reach ${BASE.r1}/status — ${err.code || err.message}`);
-    return false;
+  const deadline = Date.now() + 15000;
+  let lastErr;
+  while (Date.now() < deadline) {
+    try {
+      await axios.get(`${BASE.r1}/status`, { timeout: 2000 });
+      // If it responded, it's up
+      return true;
+    } catch (err) {
+      lastErr = err;
+      await sleep(1000);
+    }
   }
+  console.warn(`[isClusterUp] Could not reach ${BASE.r1}/status — ${lastErr?.code || lastErr?.message}`);
+  return false;
 }
 
 module.exports = { sleep, pollUntil, pollClusterUntil, exec, isClusterUp };

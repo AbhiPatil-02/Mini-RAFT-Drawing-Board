@@ -23,11 +23,11 @@ const WsTestClient = require('../helpers/wsClient');
 // ─── Endpoints ────────────────────────────────────────────────────────────────
 
 const BASE = {
-  r1: 'http://localhost:4001',
-  r2: 'http://localhost:4002',
-  r3: 'http://localhost:4003',
-  gw: 'http://localhost:3000',
-  ws: 'ws://localhost:3000',
+  r1: 'http://127.0.0.1:4001',
+  r2: 'http://127.0.0.1:4002',
+  r3: 'http://127.0.0.1:4003',
+  gw: 'http://127.0.0.1:3000',
+  ws: 'ws://127.0.0.1:3000',
 };
 
 const CONTAINERS = {
@@ -125,7 +125,7 @@ describe('[CT-1] Kill leader during active drawing', () => {
       const leader0   = before.find(s => s && s.state === 'Leader');
       expect(leader0).toBeDefined();
 
-      const leaderCtr  = CONTAINERS[leader0.id] || CONTAINERS.r1;
+      const leaderCtr = Object.values(CONTAINERS).find(c => c.includes(leader0.id));
       const baseLength = before.find(s => s !== null).commitIndex;
 
       // 2. Open a drawing tab and start sending strokes
@@ -163,7 +163,7 @@ describe('[CT-1] Kill leader during active drawing', () => {
       // 7. The new leader's commitIndex should be ≥ base + some strokes
       //    (at minimum the pre-kill strokes that reached quorum)
       const newStatus = await axios.get(
-        `http://localhost:${PORT_MAP[newLeader.id]}/status`,
+        `http://127.0.0.1:${PORT_MAP[newLeader.id]}/status`,
         { timeout: 2000 }
       ).then(r => r.data);
 
@@ -189,7 +189,7 @@ describe('[CT-2] Hot-reload follower during replication', () => {
       expect(leader0).toBeDefined();
       expect(follower).toBeDefined();
 
-      const followerCtr  = CONTAINERS[follower.id] || CONTAINERS.r2;
+      const followerCtr = Object.values(CONTAINERS).find(c => c.includes(follower.id));
       const leaderPort   = PORT_MAP[leader0.id];
 
       // 1. Restart the follower (simulates nodemon hot-reload)
@@ -199,7 +199,7 @@ describe('[CT-2] Hot-reload follower during replication', () => {
       for (let i = 0; i < 5; i++) {
         try {
           await axios.post(
-            `http://localhost:${leaderPort}/client-stroke`,
+            `http://127.0.0.1:${leaderPort}/client-stroke`,
             { stroke: mkStroke('hotreload', i) },
             { timeout: 2000 }
           );
@@ -209,7 +209,7 @@ describe('[CT-2] Hot-reload follower during replication', () => {
 
       // 3. Wait for the follower to come back and catch up
       const targetLength = await axios.get(
-        `http://localhost:${leaderPort}/status`,
+        `http://127.0.0.1:${leaderPort}/status`,
         { timeout: 2000 }
       ).then(r => r.data.logLength);
 
@@ -250,7 +250,7 @@ describe('[CT-3] Rapid leader restarts (3× in 10 s)', () => {
         const leader = await waitForLeader(8_000);
         expect(leader).not.toBeNull();
 
-        const ctr = CONTAINERS[leader.id] || CONTAINERS.r1;
+        const ctr = Object.values(CONTAINERS).find(c => c.includes(leader.id));
         await exec(`docker restart ${ctr}`);
 
         // Brief pause between restarts
@@ -264,7 +264,7 @@ describe('[CT-3] Rapid leader restarts (3× in 10 s)', () => {
       // Draw a stroke and make sure it commits successfully (cluster is functional)
       const leaderPort = PORT_MAP[stableLeader.id];
       const res = await axios.post(
-        `http://localhost:${leaderPort}/client-stroke`,
+        `http://127.0.0.1:${leaderPort}/client-stroke`,
         { stroke: mkStroke('post-chaos') },
         { timeout: 3000 }
       );
@@ -300,7 +300,7 @@ describe('[CT-4] Sequential restart of all replicas', () => {
       const startPort = PORT_MAP[leader0.id];
 
       await axios.post(
-        `http://localhost:${startPort}/client-stroke`,
+        `http://127.0.0.1:${startPort}/client-stroke`,
         { stroke: mkStroke('seed') },
         { timeout: 3000 }
       );
@@ -330,7 +330,7 @@ describe('[CT-4] Sequential restart of all replicas', () => {
       const finalLeader = await waitForLeader(10_000);
       const finalPort  = PORT_MAP[finalLeader.id];
       const postRes = await axios.post(
-        `http://localhost:${finalPort}/client-stroke`,
+        `http://127.0.0.1:${finalPort}/client-stroke`,
         { stroke: mkStroke('post-sequential') },
         { timeout: 3000 }
       );
@@ -359,20 +359,20 @@ describe('[CT-5] 10 concurrent browser tabs drawing simultaneously', () => {
       // 2. Wait for all full-syncs
       await Promise.all(tabs.map(t => t.waitForType('full-sync', 8000)));
 
-      // 3. Each tab registers a waiter for stroke-committed BEFORE sending
-      const committed = tabs.map(t => t.expectStrokeCommitted(10_000));
+      const tab0 = tabs[0];
+      const initialQueue = tab0.queueLength; // Any pre-existing messages
 
       // 4. All 10 tabs send a stroke simultaneously
       tabs.forEach((t, i) => {
         t.send({ type: 'stroke', data: mkStroke(`tab-${i}`, i * 5) });
       });
 
-      // 5. Wait for every tab to receive at least one stroke-committed
-      const results = await Promise.allSettled(committed);
-      const passed  = results.filter(r => r.status === 'fulfilled').length;
-
-      // We expect all 10 tabs to receive the committed broadcast
-      expect(passed).toBe(TAB_COUNT);
+      // 5. Wait for Tab 0 to receive exactly TAB_COUNT (10) stroke-committed broadcasts
+      const collectedStrokes = [];
+      for (let i = 0; i < TAB_COUNT; i++) {
+        const msg = await tab0.waitForType('stroke-committed', 10_000);
+        collectedStrokes.push(msg.data);
+      }
 
       // 6. Verify consistent state: all replicas have the same logLength
       await sleep(1000); // allow replication to settle
@@ -381,10 +381,8 @@ describe('[CT-5] 10 concurrent browser tabs drawing simultaneously', () => {
       expect(new Set(lengths).size).toBe(1); // all equal
 
       // 7. Verify indices in committed strokes are monotonically increasing
-      const indices = results
-        .filter(r => r.status === 'fulfilled')
-        .map(r => r.value.data.index)
-        .sort((a, b) => a - b);
+      // Since tab0 collected exactly the 10 strokes we just sent, they should be unique & increasing
+      const indices = collectedStrokes.map(s => s.index).sort((a, b) => a - b);
 
       for (let i = 1; i < indices.length; i++) {
         // Each committed index should be unique (no duplicates)

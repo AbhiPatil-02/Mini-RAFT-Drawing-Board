@@ -5,12 +5,20 @@
  *  ✓ Accept WebSocket connections from browser clients
  *  ✓ Maintain Set of active WebSocket connections
  *  ✓ On new connection: send full-sync of all committed strokes from leader
+ *    (retries once against the new leader if the first attempt fails during failover)
  *  ✓ On WS message { type:"stroke" }: forward to current leader via leaderTracker
  *  ✓ On WS message { type:"ping" }: pong back (connection keep-alive)
  *  ✓ On WS close/error: remove from clients set
  *  ✓ POST /broadcast: receive committed stroke from leader → broadcast to all clients
- *  ✓ GET  /health: return gateway liveness + current leader
+ *  ✓ GET  /health: return gateway liveness + current leader + failoverActive flag
  *  ✓ GET  /status: alias for /health (used by monitoring)
+ *
+ *  ✓ GRACEFUL FAILOVER — no client disconnects during leader transitions:
+ *      - leaderTracker queues strokes and replays them serially once a new leader is found
+ *      - failover start/end broadcasts 'leader-changing' / 'leader-restored' WS messages
+ *        so the frontend can show a status indicator without closing the connection
+ *      - sendFullSync retries against a newly discovered leader if the first attempt
+ *        fails (handles the case where a client connects exactly during failover)
  *
  * WebSocket Message Shapes (SRS §6.3):
  *
@@ -19,10 +27,12 @@
  *    { type: "ping" }
  *
  *  Gateway → Client:
- *    { type: "stroke-committed", data: { index, points, color, width, userId? } }
- *    { type: "full-sync",        data: { strokes: [ { index, points, color, width } ] } }
+ *    { type: "stroke-committed",  data: { index, points, color, width, userId? } }
+ *    { type: "full-sync",         data: { strokes: [ { index, points, color, width } ] } }
+ *    { type: "leader-changing",   data: { message } }   ← NEW: failover started
+ *    { type: "leader-restored",   data: { leader } }    ← NEW: failover ended
  *    { type: "pong" }
- *    { type: "error",            data: { message } }
+ *    { type: "error",             data: { message } }
  */
 
 const express       = require('express');
@@ -71,33 +81,67 @@ function broadcast(payload) {
 const axios = require('axios');
 
 /**
+ * Full-sync retry wait (ms).  If the leader just died, we wait briefly and
+ * then try again against whatever leader the tracker has found by then.
+ */
+const FULL_SYNC_RETRY_WAIT_MS  = 1500;
+const FULL_SYNC_RETRY_ATTEMPTS = 2;
+
+/**
  * Ask the leader for its committed log and send it to a newly connected client.
  *
  * Goes directly to GET /committed-log on the known leader — no pre-flight /status
  * call needed (leaderTracker already guarantees the URL is a current Leader).
- * Sends an empty full-sync on any failure so the client can still start drawing.
+ *
+ * Retry logic (graceful failover):
+ *   If the first attempt fails (leader just died), we wait FULL_SYNC_RETRY_WAIT_MS
+ *   and retry — by then leaderTracker will usually have elected a new leader.
+ *   After FULL_SYNC_RETRY_ATTEMPTS failures we fall back to an empty sync so
+ *   the client can still start drawing (it will receive future strokes via broadcast).
  */
 async function sendFullSync(ws) {
-  const leaderUrl = leaderTracker.getLeader();
+  for (let attempt = 1; attempt <= FULL_SYNC_RETRY_ATTEMPTS; attempt++) {
+    const leaderUrl = leaderTracker.getLeader();
 
-  if (!leaderUrl) {
-    // No leader yet known — send empty sync; client will receive strokes
-    // via broadcast once the tracker finds a leader.
-    sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-    console.log(`[Gateway] Full-sync: no leader yet — sent empty sync to client ${ws.id}`);
-    return;
+    if (!leaderUrl) {
+      if (attempt < FULL_SYNC_RETRY_ATTEMPTS) {
+        // Still in failover — wait for the tracker to find a new leader
+        console.log(
+          `[Gateway] Full-sync attempt ${attempt}: no leader yet — ` +
+          `waiting ${FULL_SYNC_RETRY_WAIT_MS}ms for failover to resolve`
+        );
+        await new Promise(r => setTimeout(r, FULL_SYNC_RETRY_WAIT_MS));
+        continue;
+      }
+      // Final attempt, still no leader — send empty sync
+      sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
+      console.log(`[Gateway] Full-sync: no leader — sent empty sync to client ${ws.id}`);
+      return;
+    }
+
+    try {
+      const logRes  = await axios.get(`${leaderUrl}/committed-log`, { timeout: 2000 });
+      const strokes = logRes.data.strokes || [];
+      sendToClient(ws, { type: 'full-sync', data: { strokes } });
+      console.log(
+        `[Gateway] Full-sync → client ${ws.id}: ${strokes.length} stroke(s) from ${leaderUrl}` +
+        (attempt > 1 ? ` (after ${attempt} attempts)` : '')
+      );
+      return; // Success
+    } catch (err) {
+      console.warn(
+        `[Gateway] Full-sync attempt ${attempt} failed for client ${ws.id}: ${err.message}`
+      );
+      if (attempt < FULL_SYNC_RETRY_ATTEMPTS) {
+        // Leader became unreachable — wait for tracker to re-discover
+        await new Promise(r => setTimeout(r, FULL_SYNC_RETRY_WAIT_MS));
+      }
+    }
   }
 
-  try {
-    const logRes  = await axios.get(`${leaderUrl}/committed-log`, { timeout: 2000 });
-    const strokes = logRes.data.strokes || [];
-    sendToClient(ws, { type: 'full-sync', data: { strokes } });
-    console.log(`[Gateway] Full-sync → client ${ws.id}: ${strokes.length} stroke(s) from ${leaderUrl}`);
-  } catch (err) {
-    // Leader unreachable or /committed-log not yet available — degrade gracefully
-    console.warn(`[Gateway] Full-sync failed for client ${ws.id}: ${err.message}`);
-    sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-  }
+  // All attempts failed — send empty sync so client can still draw
+  sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
+  console.warn(`[Gateway] Full-sync: all ${FULL_SYNC_RETRY_ATTEMPTS} attempts failed for client ${ws.id} — sent empty sync`);
 }
 
 // ── WebSocket event handling ───────────────────────────────────────────────────
@@ -107,6 +151,15 @@ wss.on('connection', (ws, req) => {
 
   const clientIp = req.socket.remoteAddress || 'unknown';
   console.log(`[Gateway] Client #${ws.id} connected from ${clientIp} — total: ${clients.size}`);
+
+  // If a failover is in progress right now, tell this client immediately so
+  // it can show a "leader changing" indicator in the UI while we do the full-sync
+  if (leaderTracker.isFailoverInProgress()) {
+    sendToClient(ws, {
+      type: 'leader-changing',
+      data: { message: 'Leader election in progress — strokes will be delivered shortly' },
+    });
+  }
 
   // Send full canvas state immediately on connect (FR-FE-10, FR-GW-05)
   sendFullSync(ws);
@@ -191,26 +244,28 @@ app.post('/broadcast', (req, res) => {
 /**
  * GET /health
  * Returns gateway liveness, the currently tracked leader URL, connected
- * client count, and pending stroke queue depth.
- * Shape: { status, leader, clients, queueDepth }
+ * client count, pending stroke queue depth, and whether a failover is in progress.
+ * Shape: { status, leader, clients, queueDepth, failoverActive }
  */
 app.get('/health', (req, res) => {
   const stats = leaderTracker.getStats();
   res.json({
-    status:     'ok',
-    leader:     stats.leader,
-    clients:    clients.size,
-    queueDepth: stats.queueDepth,
+    status:        'ok',
+    leader:        stats.leader,
+    clients:       clients.size,
+    queueDepth:    stats.queueDepth,
+    failoverActive: stats.failoverActive,
   });
 });
 
 app.get('/status', (req, res) => {
   const stats = leaderTracker.getStats();
   res.json({
-    status:     'ok',
-    leader:     stats.leader,
-    clients:    clients.size,
-    queueDepth: stats.queueDepth,
+    status:        'ok',
+    leader:        stats.leader,
+    clients:       clients.size,
+    queueDepth:    stats.queueDepth,
+    failoverActive: stats.failoverActive,
   });
 });
 
@@ -222,6 +277,35 @@ leaderTracker.onLeaderChange((newLeader, prevLeader) => {
     console.log(`[Gateway] Leader changed: ${prevLeader || 'none'} → ${newLeader}`);
   } else {
     console.warn(`[Gateway] Leader lost (was ${prevLeader}) — strokes will be queued`);
+  }
+});
+
+/**
+ * Broadcast failover state changes to ALL connected WebSocket clients.
+ *
+ *  isActive=true  → leadership is changing; strokes are queued
+ *                   clients receive  { type: 'leader-changing', data: { message } }
+ *                   so they can show an "election in progress" status pill
+ *                   WITHOUT closing the WebSocket connection.
+ *
+ *  isActive=false → new leader found, queue drained; system is healthy again
+ *                   clients receive  { type: 'leader-restored', data: { leader } }
+ *                   so they can update the leader badge and hide the indicator.
+ */
+leaderTracker.onFailoverStateChange((isActive) => {
+  if (isActive) {
+    console.log('[Gateway] ⚡ Failover started — broadcasting leader-changing to all clients');
+    broadcast({
+      type: 'leader-changing',
+      data: { message: 'Leader election in progress — your strokes are safely queued' },
+    });
+  } else {
+    const newLeader = leaderTracker.getLeader();
+    console.log(`[Gateway] ✅ Failover complete — broadcasting leader-restored (${newLeader})`);
+    broadcast({
+      type: 'leader-restored',
+      data: { leader: newLeader },
+    });
   }
 });
 

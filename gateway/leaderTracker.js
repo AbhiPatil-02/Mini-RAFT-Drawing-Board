@@ -12,13 +12,18 @@
  *    use that URL directly instead of re-polling (reduces failover latency significantly)
  *  ✓ Queue depth guard: cap queued strokes at MAX_QUEUE_SIZE (drops oldest)
  *  ✓ Replay retry limit: each queued stroke is retried at most MAX_REPLAY_RETRIES times
+ *  ✓ Failover lock: a single forwardStroke recovery path runs at a time —
+ *    concurrent strokes during failover are queued without spawning duplicate discovery loops
  *  ✓ getLeader(): return current leader URL (used by server.js /health)
+ *  ✓ isFailoverInProgress(): return true while discovery/replay is running
  *  ✓ onLeaderChange(cb): register a callback fired whenever the tracked leader changes
+ *  ✓ onFailoverStateChange(cb): callback fired when failover transitions start/end
  *
  * Failure handling (FR-GW-07, FR-GW-08, FR-GW-09):
  *  - If leader is unreachable: stroke is queued, re-discovery runs immediately
  *  - Queued strokes are replayed in order once a new leader is found
  *  - Clients are NEVER disconnected during a leader change
+ *  - Only ONE recovery path runs at a time (failoverLock guard)
  *
  * Performance:
  *  - discoverLeader() polls all replicas in PARALLEL — leader found in one RTT
@@ -45,10 +50,37 @@ const MAX_REPLAY_RETRIES = 3;     // Max delivery attempts per queued stroke
 // ── Internal state ────────────────────────────────────────────────────────────
 let currentLeader     = null;   // Base URL e.g. "http://replica1:4001", or null
 let discoverInFlight  = false;  // Prevents concurrent discovery races
+let failoverLock      = false;  // Prevents concurrent forwardStroke recovery paths
+let failoverActive    = false;  // True while a failover (discovery + replay) is running
 let pollTimer         = null;   // Handle for the periodic poll setInterval
 
-const strokeQueue     = [];     // Pending strokes during leader-less periods
-let leaderChangeCallback = null; // Optional external change listener
+const strokeQueue          = [];     // Pending strokes during leader-less periods
+let leaderChangeCallback   = null;   // Optional external change listener
+let failoverStateCallback  = null;   // Optional external failover state listener
+
+// ── Failover State Notification ───────────────────────────────────────────────
+
+/**
+ * Register a callback fired whenever the failover state changes.
+ * callback(isActive: boolean)
+ *   isActive=true  → failover started (leader lost)
+ *   isActive=false → failover ended (leader restored, queue drained)
+ *
+ * server.js uses this to broadcast a 'leader-changing' or 'leader-restored'
+ * WebSocket message to all connected clients — keeps them informed without
+ * disconnecting them.
+ */
+function onFailoverStateChange(cb) {
+  failoverStateCallback = cb;
+}
+
+function _setFailoverActive(isActive) {
+  if (isActive === failoverActive) return; // No change
+  failoverActive = isActive;
+  if (failoverStateCallback) {
+    try { failoverStateCallback(isActive); } catch {}
+  }
+}
 
 // ── Leader Change Notification ────────────────────────────────────────────────
 
@@ -161,7 +193,12 @@ function _enqueue(stroke) {
  * Uses a draining loop so strokes added during replay are also processed.
  */
 async function replayQueue() {
-  if (strokeQueue.length === 0) return;
+  if (strokeQueue.length === 0) {
+    // No strokes to replay — failover is done
+    _setFailoverActive(false);
+    return;
+  }
+
   console.log(`[LeaderTracker] Replaying ${strokeQueue.length} queued stroke(s) to ${currentLeader}`);
 
   while (strokeQueue.length > 0 && currentLeader) {
@@ -207,6 +244,12 @@ async function replayQueue() {
       if (!currentLeader) break; // Still no leader — stop replaying
     }
   }
+
+  // Queue is fully drained (or we ran out of leader) — failover complete
+  if (strokeQueue.length === 0) {
+    _setFailoverActive(false);
+    console.log('[LeaderTracker] Queue drained — failover complete');
+  }
 }
 
 // ── Leader Resolution Helpers ─────────────────────────────────────────────────
@@ -240,6 +283,49 @@ async function _resolveLeaderFromHint(hintLeaderId) {
   return currentLeader !== null;
 }
 
+// ── Failover Recovery (serialised) ───────────────────────────────────────────
+
+/**
+ * Single entry-point for any stroke-forward failure recovery path.
+ *
+ * The failoverLock ensures only ONE recovery goroutine runs at a time.
+ * If a second concurrent forwardStroke() call hits an error while recovery
+ * is already running, it simply enqueues its stroke and returns — the ongoing
+ * recovery will pick it up during replayQueue().
+ *
+ * This prevents:
+ *  - Multiple simultaneous discoverLeader() calls racing each other
+ *  - Multiple simultaneous replayQueue() loops delivering strokes out of order
+ *
+ * @param {object} strokeToQueue - stroke that triggered the failure (enqueued first)
+ */
+async function _runFailoverRecovery(strokeToQueue) {
+  // Always queue the failing stroke first
+  _enqueue(strokeToQueue);
+
+  // Signal failover has started (only on first entry)
+  _setFailoverActive(true);
+
+  // If another recovery is already in progress, just return —
+  // the ongoing recovery will drain this stroke from the queue too.
+  if (failoverLock) {
+    console.log('[LeaderTracker] Failover already in progress — stroke queued, recovery running');
+    return;
+  }
+
+  failoverLock = true;
+  try {
+    _setLeader(null);
+    await discoverLeader(); // Will call replayQueue() internally when leader found
+  } finally {
+    failoverLock = false;
+    // If queue is still non-empty (no leader found), failover remains active
+    if (strokeQueue.length === 0) {
+      _setFailoverActive(false);
+    }
+  }
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
@@ -262,21 +348,39 @@ function getLeader() {
 }
 
 /**
+ * Return true while a failover recovery (discovery + replay) is actively running.
+ * Used by server.js /health to expose failover state to the frontend.
+ */
+function isFailoverInProgress() {
+  return failoverActive;
+}
+
+/**
  * Forward a stroke to the current leader via POST /client-stroke.
  *
  * Behaviour:
  *  - No leader known         → queue stroke, trigger discovery (FR-GW-08)
  *  - Leader reachable        → POST stroke, return result
  *  - Leader says "not leader"→ use leader hint to fast-path re-discovery (FR-GW-09)
- *  - Leader unreachable      → queue stroke, null out leader, re-discover,
- *                              replay queue once new leader found (FR-GW-07)
+ *  - Leader unreachable      → enter serialised failover recovery:
+ *                              enqueue stroke, null leader, discover new leader,
+ *                              replay queue once found — all within a single lock
+ *                              so concurrent failures don't race each other
  */
 async function forwardStroke(stroke) {
-  // ── Case 1: No leader currently known ──────────────────────────────────────
+  // ── Case 1: No leader currently known (or failover already running) ─────────
   if (!currentLeader) {
     console.warn('[LeaderTracker] No leader — queuing stroke');
     _enqueue(stroke);
-    discoverLeader(); // Kick off discovery (non-blocking)
+    _setFailoverActive(true);
+    if (!failoverLock) {
+      // Kick off a fresh recovery attempt
+      failoverLock = true;
+      discoverLeader().finally(() => {
+        failoverLock = false;
+        if (strokeQueue.length === 0) _setFailoverActive(false);
+      });
+    }
     return { queued: true };
   }
 
@@ -293,9 +397,7 @@ async function forwardStroke(stroke) {
       console.warn(
         `[LeaderTracker] Leader rejected stroke: "${res.data.error}" — resolving via hint`
       );
-      _setLeader(null);
-      _enqueue(stroke);
-      await _resolveLeaderFromHint(res.data.leader);
+      await _runFailoverRecovery(stroke);
       return { queued: true };
     }
 
@@ -304,11 +406,9 @@ async function forwardStroke(stroke) {
   } catch (err) {
     // ── Case 3: Leader unreachable (timeout / network error) ─────────────────
     console.error(
-      `[LeaderTracker] Leader unreachable (${err.message}) — queuing stroke, re-discovering`
+      `[LeaderTracker] Leader unreachable (${err.message}) — entering serialised failover`
     );
-    _setLeader(null);
-    _enqueue(stroke);
-    await discoverLeader(); // Will replay the queue once a new leader is found
+    await _runFailoverRecovery(stroke);
     return { queued: true };
   }
 }
@@ -318,10 +418,19 @@ async function forwardStroke(stroke) {
  */
 function getStats() {
   return {
-    leader:     currentLeader,
-    queueDepth: strokeQueue.length,
-    replicas:   REPLICAS,
+    leader:           currentLeader,
+    queueDepth:       strokeQueue.length,
+    failoverActive,
+    replicas:         REPLICAS,
   };
 }
 
-module.exports = { start, getLeader, forwardStroke, onLeaderChange, getStats };
+module.exports = {
+  start,
+  getLeader,
+  isFailoverInProgress,
+  forwardStroke,
+  onLeaderChange,
+  onFailoverStateChange,
+  getStats,
+};

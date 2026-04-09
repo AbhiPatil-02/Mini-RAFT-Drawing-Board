@@ -10,7 +10,7 @@
     "test:all": "npm run test:unit && npm run test:integration && npm run test:chaos"
   },
   "dependencies": {
-    "axios": "0.27.2",
+    "axios": "^1.15.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {

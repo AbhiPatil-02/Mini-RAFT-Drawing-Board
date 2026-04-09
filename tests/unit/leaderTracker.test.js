@@ -10,15 +10,17 @@
  *  - process.env.REPLICAS is set before each require to control the replica list.
  *
  * Coverage:
- *  ✓ getLeader()           — null on start, set after discovery
- *  ✓ getStats()            — leader + queueDepth + replicas shape
- *  ✓ discoverLeader()      — parallel poll, selects first Leader replica
- *  ✓ discoverLeader()      — no leader found → currentLeader stays null
- *  ✓ forwardStroke()       — success path, queues on no-leader, queues on failure
- *  ✓ forwardStroke()       — uses leader hint on not-leader response
- *  ✓ stroke queue          — depth guard (MAX_QUEUE_SIZE), retry limit
- *  ✓ onLeaderChange()      — callback fires on leader change
- *  ✓ _verifyHint()         — confirmed via forwardStroke hint resolution
+ *  ✓ getLeader()              — null on start, set after discovery
+ *  ✓ getStats()               — leader + queueDepth + failoverActive + replicas shape
+ *  ✓ isFailoverInProgress()   — false initially, true when no leader and stroke queued
+ *  ✓ discoverLeader()         — parallel poll, selects first Leader replica
+ *  ✓ discoverLeader()         — no leader found → currentLeader stays null
+ *  ✓ forwardStroke()          — success path, queues on no-leader, queues on failure
+ *  ✓ forwardStroke()          — uses leader hint on not-leader response
+ *  ✓ stroke queue             — depth guard (MAX_QUEUE_SIZE), retry limit
+ *  ✓ onLeaderChange()         — callback fires on leader change
+ *  ✓ onFailoverStateChange()  — fires isActive=true/false on failover transitions
+ *  ✓ failover lock            — concurrent forwardStroke calls serialised during recovery
  */
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -79,8 +81,9 @@ describe('getStats()', () => {
     loadTracker();
     const stats = tracker.getStats();
     expect(stats).toMatchObject({
-      leader:     null,
-      queueDepth: 0,
+      leader:        null,
+      queueDepth:    0,
+      failoverActive: false,
     });
     expect(Array.isArray(stats.replicas)).toBe(true);
     expect(stats.replicas).toHaveLength(3);
@@ -357,5 +360,179 @@ describe('onLeaderChange()', () => {
 
     expect(cb2).toHaveBeenCalled();
     expect(cb1).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isFailoverInProgress() / getStats().failoverActive
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('isFailoverInProgress()', () => {
+  test('returns false on startup (no failover triggered)', () => {
+    loadTracker();
+    expect(tracker.isFailoverInProgress()).toBe(false);
+    expect(tracker.getStats().failoverActive).toBe(false);
+  });
+
+  test('returns true immediately when a stroke is forwarded with no leader', () => {
+    loadTracker();
+    axiosMock.get.mockResolvedValue({ data: { state: 'Follower' } });
+
+    // Fire-and-forget (don't await — inspect before async discovery settles)
+    tracker.forwardStroke(STROKE);
+
+    // Synchronously after queueing: failover should be active
+    expect(tracker.isFailoverInProgress()).toBe(true);
+    expect(tracker.getStats().failoverActive).toBe(true);
+  });
+
+  test('getStats() contains failoverActive boolean field', () => {
+    loadTracker();
+    const stats = tracker.getStats();
+    expect(Object.prototype.hasOwnProperty.call(stats, 'failoverActive')).toBe(true);
+    expect(typeof stats.failoverActive).toBe('boolean');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// onFailoverStateChange() callback
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('onFailoverStateChange()', () => {
+  test('fires with isActive=true when forwardStroke encounters no leader', async () => {
+    loadTracker();
+
+    const states = [];
+    tracker.onFailoverStateChange((isActive) => states.push(isActive));
+
+    axiosMock.get.mockResolvedValue({ data: { state: 'Follower' } });
+
+    await tracker.forwardStroke(STROKE);
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(states).toContain(true);
+  });
+
+  test('fires with isActive=false after queue is drained by a new leader', async () => {
+    loadTracker();
+
+    const states = [];
+    tracker.onFailoverStateChange((isActive) => states.push(isActive));
+
+    // First: no leader → failover active
+    axiosMock.get.mockResolvedValue({ data: { state: 'Follower' } });
+    await tracker.forwardStroke(STROKE);
+    await new Promise(r => setTimeout(r, 50));
+    expect(states).toContain(true);
+
+    // Now a leader is found → queue replayed → failover ends
+    axiosMock.get.mockImplementation((url) => {
+      if (url.includes('replica1')) return Promise.resolve({ data: { state: 'Leader' } });
+      return Promise.resolve({ data: { state: 'Follower' } });
+    });
+    axiosMock.post.mockResolvedValue({ data: { success: true, index: 1 } });
+
+    tracker.start(); // triggers discovery → replayQueue → _setFailoverActive(false)
+    await new Promise(r => setTimeout(r, 200));
+
+    expect(states).toContain(false);
+  });
+
+  test('does not crash when the callback itself throws', async () => {
+    loadTracker();
+
+    tracker.onFailoverStateChange(() => { throw new Error('failover cb error'); });
+    axiosMock.get.mockResolvedValue({ data: { state: 'Follower' } });
+
+    // Should not propagate the error
+    await expect(tracker.forwardStroke(STROKE)).resolves.toMatchObject({ queued: true });
+  });
+
+  test('only the last registered callback is active', async () => {
+    loadTracker();
+
+    const cb1 = jest.fn();
+    const cb2 = jest.fn();
+    tracker.onFailoverStateChange(cb1);
+    tracker.onFailoverStateChange(cb2); // overrides cb1
+
+    axiosMock.get.mockResolvedValue({ data: { state: 'Follower' } });
+    await tracker.forwardStroke(STROKE);
+    await new Promise(r => setTimeout(r, 50));
+
+    expect(cb2).toHaveBeenCalled();
+    expect(cb1).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Serialised failover lock — concurrent forwardStroke calls during failover
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('failover lock (serialised recovery)', () => {
+  test('all concurrent forwardStroke calls during leader outage get { queued: true }', async () => {
+    loadTracker();
+
+    // Establish a known leader
+    axiosMock.get.mockResolvedValue({ data: { state: 'Leader' } });
+    tracker.start();
+    await new Promise(r => setTimeout(r, 50));
+    expect(tracker.getLeader()).not.toBeNull();
+
+    // Leader POST fails; re-discovery also finds no leader
+    axiosMock.post.mockRejectedValue(new Error('ECONNREFUSED'));
+    axiosMock.get.mockResolvedValue({ data: { state: 'Follower' } });
+
+    // 5 simultaneous stroke forwards
+    const results = await Promise.all([
+      tracker.forwardStroke({ ...STROKE, color: 'c1' }),
+      tracker.forwardStroke({ ...STROKE, color: 'c2' }),
+      tracker.forwardStroke({ ...STROKE, color: 'c3' }),
+      tracker.forwardStroke({ ...STROKE, color: 'c4' }),
+      tracker.forwardStroke({ ...STROKE, color: 'c5' }),
+    ]);
+
+    for (const r of results) {
+      expect(r).toMatchObject({ queued: true });
+    }
+    // All 5 must be in the queue — none lost
+    expect(tracker.getStats().queueDepth).toBe(5);
+  });
+
+  test('discovery GET calls are bounded when many concurrent failures occur', async () => {
+    loadTracker();
+
+    let getCallCount = 0;
+    axiosMock.get.mockImplementation(async () => {
+      getCallCount++;
+      await new Promise(r => setTimeout(r, 20));
+      return { data: { state: 'Follower' } };
+    });
+    axiosMock.post.mockRejectedValue(new Error('ECONNREFUSED'));
+
+    // First: seed a known leader via startup
+    axiosMock.get.mockResolvedValueOnce({ data: { state: 'Leader' } });
+    tracker.start();
+    await new Promise(r => setTimeout(r, 50));
+    getCallCount = 0; // reset after startup
+
+    // Re-enable Follower responses so recovery finds no leader
+    axiosMock.get.mockImplementation(async () => {
+      getCallCount++;
+      await new Promise(r => setTimeout(r, 20));
+      return { data: { state: 'Follower' } };
+    });
+
+    // 3 concurrent failures
+    await Promise.all([
+      tracker.forwardStroke({ ...STROKE, color: 'a' }),
+      tracker.forwardStroke({ ...STROKE, color: 'b' }),
+      tracker.forwardStroke({ ...STROKE, color: 'c' }),
+    ]);
+    await new Promise(r => setTimeout(r, 200));
+
+    // Without the lock: 3 concurrent recoveries × 3 replicas = up to 9 GET calls.
+    // With the lock: only 1 recovery runs → at most 3 GET calls in that round.
+    expect(getCallCount).toBeLessThan(9);
   });
 });
