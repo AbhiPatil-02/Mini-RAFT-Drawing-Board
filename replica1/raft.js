@@ -196,6 +196,22 @@ async function sendHeartbeats() {
         becomeFollower(res.data.term);
         return; // Stop sending once we've stepped down
       }
+
+      // Proactive catch-up: if the follower's log is behind our commitIndex, send it
+      // the missing entries immediately — without waiting for an AppendEntries rejection.
+      // This is the key mechanism that makes a restarted node catch up automatically
+      // even when no new strokes arrive from clients.
+      if (
+        res.data.success &&
+        typeof res.data.logLength === 'number' &&
+        res.data.logLength < commitIndex
+      ) {
+        console.log(
+          `[RAFT][${config.REPLICA_ID}] ${peer} is lagging` +
+          ` (logLength=${res.data.logLength} < commitIndex=${commitIndex}) — proactive /sync-log`
+        );
+        triggerSyncLog(peer, res.data.logLength).catch(() => {});
+      }
     } catch {
       // Peer unreachable — it will eventually time out and start an election itself
     }
@@ -279,7 +295,8 @@ function handleHeartbeat(body) {
     console.log(`[RAFT][${config.REPLICA_ID}] commitIndex → ${commitIndex} (via heartbeat from ${leaderId})`);
   }
 
-  return { term: currentTerm, success: true };
+  // Return logLength so the leader can detect if we are lagging and trigger /sync-log
+  return { term: currentTerm, success: true, logLength: log.length };
 }
 
 /**
