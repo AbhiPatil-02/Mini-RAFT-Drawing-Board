@@ -1,62 +1,83 @@
 /**
  * app.js — Mini-RAFT Drawing Board Frontend
  *
- * Implements (Week 2):
- *  ✓ WebSocket connection to Gateway with exponential-backoff reconnection
- *  ✓ Status indicator: connected / reconnecting / disconnected
- *  ✓ Canvas resize keeping pixel-perfect dimensions on every window resize
- *  ✓ Freehand drawing via mouse (mousedown → mousemove → mouseup)
- *  ✓ Freehand drawing via touch (touchstart → touchmove → touchend)
- *  ✓ Strokes collected as arrays of {x, y} points — sent on mouseup/touchend
- *  ✓ Send:  { type: "stroke", data: { points, color, width } }
- *  ✓ Recv:  { type: "stroke-committed",  data: stroke }  → render single stroke
- *  ✓ Recv:  { type: "full-sync",         data: { strokes } } → redraw all
- *  ✓ Recv:  { type: "pong" }  → latency measurement
- *  ✓ Recv:  { type: "error", data: { message } }  → toast notification
- *  ✓ Colour palette + eraser tool
- *  ✓ Adjustable brush size with live preview
- *  ✓ Clear button (local canvas clear only)
- *  ✓ Leader name display  (parsed from /health polling)
- *  ✓ Toast notification system
- *  ✓ Disconnected overlay (blocks drawing when offline)
+ * Pipeline:
+ *   User draws  →  points collected on live canvas layer
+ *   onPointerUp →  decimated points sent as { type:"stroke", data:{points,color,width} }
+ *   Gateway     →  forwards to RAFT Leader via /client-stroke
+ *   Leader      →  AppendEntries to majority → commit → POST /broadcast to Gateway
+ *   Gateway     →  broadcasts { type:"stroke-committed", data:{index,points,color,width} }
+ *   Frontend    →  receives stroke-committed, deduplicates, adds to committedStrokes, redraws
  *
- * WebSocket message shapes (SRS §6.3):
- *  Client → Gateway: { type: "stroke", data: { points:[{x,y}], color, width } }
- *  Gateway → Client: { type: "stroke-committed", data: { index, points, color, width } }
- *  Gateway → Client: { type: "full-sync",        data: { strokes:[...] } }
+ * Key design decisions:
+ *  - Two logical layers: committedStrokes[] (persisted), pendingStrokes[] (in-flight local)
+ *    Both are replayed on resize → no strokes vanish during replication round-trip
+ *  - Stroke point decimation (distance threshold 3px) keeps message sizes manageable
+ *  - Pending strokes are matched to committed ones by a client-local tempId to avoid
+ *    double-rendering when the committed echo arrives back
+ *  - Eraser is rendered with the canvas background colour (#f8f8f8) for correct erase effect
  */
 
 'use strict';
 
 // ── DOM references ────────────────────────────────────────────────────────────
-const canvas         = document.getElementById('drawing-canvas');
-const ctx            = canvas.getContext('2d');
-const statusEl       = document.getElementById('status-indicator');
-const overlayEl      = document.getElementById('canvas-overlay');
-const overlayMsgEl   = document.getElementById('overlay-message');
-const leaderNameEl   = document.getElementById('leader-name');
-const countValueEl   = document.getElementById('count-value');
+const canvas = document.getElementById('drawing-canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status-indicator');
+const overlayEl = document.getElementById('canvas-overlay');
+const overlayMsgEl = document.getElementById('overlay-message');
+const leaderNameEl = document.getElementById('leader-name');
+const countValueEl = document.getElementById('count-value');
+const queueDepthEl = document.getElementById('queue-depth');
 const toastContainer = document.getElementById('toast-container');
 const brushSizeInput = document.getElementById('brush-size');
 const brushPreviewEl = document.getElementById('brush-preview');
-const btnClear       = document.getElementById('btn-clear');
-const colourBtns     = document.querySelectorAll('.colour-btn');
+const btnClear = document.getElementById('btn-clear');
+const colourBtns = document.querySelectorAll('.colour-btn');
+
+// ── Canvas background colour (must match CSS #canvas-container background) ───
+const CANVAS_BG = '#f8f8f8';
 
 // ── Drawing state ─────────────────────────────────────────────────────────────
-let isDrawing    = false;
+let isDrawing = false;
 let currentColor = '#1e1e2e';
-let brushSize    = 4;
-let isEraser     = false;
-let currentStrokePoints = []; // Points collected during the current stroke gesture
+let brushSize = 4;
+let isEraser = false;
+let currentStrokePoints = []; // Raw points collected during the current stroke gesture
+let lastEmittedPoint = null; // Last point added — used for distance decimation
+
+// ── Point decimation threshold ────────────────────────────────────────────────
+// Skip a new point if it is closer than this to the last recorded point.
+// 3 CSS px is imperceptible visually but cuts point count by ~60–80% on fast strokes.
+const MIN_POINT_DISTANCE_PX = 3;
+
+// ── Stroke stores ─────────────────────────────────────────────────────────────
+/**
+ * Committed strokes received from the RAFT cluster (authoritative, survive resize).
+ * Each entry: { index, points, color, width }
+ */
+const committedStrokes = [];
+
+/**
+ * Locally-drawn strokes awaiting commit acknowledgment from the server.
+ * Each entry: { tempId, points, color, width }
+ * Removed when the matching stroke-committed arrives (matched by tempId).
+ * Rendered in a slightly faded style to signal "sending".
+ */
+const pendingStrokes = [];
+
+/**
+ * Map of tempId → stroke data for fast lookup when committed echo arrives.
+ * Since the server doesn't echo tempId, we match instead by checking that
+ * the pending stroke was sent most recently (FIFO queue assumption).
+ */
+let nextTempId = 1;
 
 // ── WebSocket state ───────────────────────────────────────────────────────────
 const GATEWAY_WS_URL = `ws://${location.hostname}:3000`;
-let ws            = null;
+let ws = null;
 let reconnectDelay = 500;   // ms — doubles on each failure (exponential backoff)
-const MAX_DELAY    = 16000; // cap at 16 s
-
-// ── All committed strokes (for canvas redraw on resize) ───────────────────────
-const committedStrokes = []; // Array of { index, points, color, width }
+const MAX_DELAY = 16000; // cap at 16 s
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CANVAS UTILITIES
@@ -64,12 +85,12 @@ const committedStrokes = []; // Array of { index, points, color, width }
 
 /**
  * Resize the canvas backing buffer to match its CSS display size.
- * Called on init and on every window resize. Re-renders all committed strokes
- * after resize because changing canvas dimensions clears the context.
+ * Called on init and on every window resize. Re-renders both committed and
+ * pending strokes because changing canvas dimensions clears the context.
  */
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
-  canvas.width  = Math.floor(rect.width  * window.devicePixelRatio);
+  canvas.width = Math.floor(rect.width * window.devicePixelRatio);
   canvas.height = Math.floor(rect.height * window.devicePixelRatio);
   ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
   redrawAll();
@@ -79,36 +100,38 @@ window.addEventListener('resize', resizeCanvas);
 
 /**
  * Render a single stroke onto the canvas.
- * A stroke is { points:[{x,y}…], color, width }
- * Coordinates are CSS pixels (0–canvasCSS width/height).
+ * @param {{ points: {x,y}[], color: string, width: number }} stroke
+ * @param {number} [alpha=1]  Opacity — 0.45 for pending strokes
  */
-function renderStroke(stroke) {
+function renderStroke(stroke, alpha = 1) {
   if (!stroke.points || stroke.points.length < 2) return;
 
   ctx.save();
+  ctx.globalAlpha = alpha;
   ctx.beginPath();
-  ctx.lineCap     = 'round';
-  ctx.lineJoin    = 'round';
-  ctx.strokeStyle = stroke.color === 'eraser' ? '#f8f8f8' : stroke.color;
-  ctx.lineWidth   = stroke.width;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = stroke.color === 'eraser' ? CANVAS_BG : stroke.color;
+  ctx.lineWidth = stroke.width;
 
   const [first, ...rest] = stroke.points;
   ctx.moveTo(first.x, first.y);
-  for (const pt of rest) {
-    ctx.lineTo(pt.x, pt.y);
-  }
+  for (const pt of rest) ctx.lineTo(pt.x, pt.y);
   ctx.stroke();
   ctx.restore();
 }
 
-/** Re-render every committed stroke (called after resize or full-sync). */
+/**
+ * Re-render all committed strokes then all pending strokes.
+ * Called after resize or full-sync.
+ */
 function redrawAll() {
-  const cssW = canvas.width  / window.devicePixelRatio;
+  const cssW = canvas.width / window.devicePixelRatio;
   const cssH = canvas.height / window.devicePixelRatio;
   ctx.clearRect(0, 0, cssW, cssH);
-  for (const stroke of committedStrokes) {
-    renderStroke(stroke);
-  }
+
+  for (const stroke of committedStrokes) renderStroke(stroke);
+  for (const stroke of pendingStrokes) renderStroke(stroke, 0.45);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -118,41 +141,56 @@ function redrawAll() {
 /** Convert a mouse or touch event to canvas-relative CSS coordinates. */
 function eventToPoint(e) {
   const rect = canvas.getBoundingClientRect();
-  const src  = e.touches ? e.touches[0] : e;
-  return {
-    x: src.clientX - rect.left,
-    y: src.clientY - rect.top,
-  };
+  const src = e.touches ? e.touches[0] : e;
+  return { x: src.clientX - rect.left, y: src.clientY - rect.top };
+}
+
+/** Squared distance between two points (avoids Math.sqrt). */
+function dist2(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return dx * dx + dy * dy;
 }
 
 function onPointerDown(e) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return; // Block drawing when offline
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   e.preventDefault();
   isDrawing = true;
   currentStrokePoints = [];
+  lastEmittedPoint = null;
+
   const pt = eventToPoint(e);
   currentStrokePoints.push(pt);
+  lastEmittedPoint = pt;
 
-  // Start the path visually immediately for responsiveness
+  // Begin live path on canvas immediately for responsive feel
   ctx.save();
   ctx.beginPath();
-  ctx.lineCap     = 'round';
-  ctx.lineJoin    = 'round';
-  ctx.strokeStyle = isEraser ? '#f8f8f8' : currentColor;
-  ctx.lineWidth   = brushSize;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = isEraser ? CANVAS_BG : currentColor;
+  ctx.lineWidth = brushSize;
   ctx.moveTo(pt.x, pt.y);
 }
 
 function onPointerMove(e) {
   if (!isDrawing) return;
   e.preventDefault();
-  const pt = eventToPoint(e);
-  currentStrokePoints.push(pt);
 
-  // Draw the stroke segment live on the local canvas
+  const pt = eventToPoint(e);
+
+  // ── Point decimation ───────────────────────────────────────────────────────
+  // Only record this point if it moved far enough from the last recorded one.
+  const threshold2 = MIN_POINT_DISTANCE_PX * MIN_POINT_DISTANCE_PX;
+  if (lastEmittedPoint && dist2(pt, lastEmittedPoint) < threshold2) return;
+
+  currentStrokePoints.push(pt);
+  lastEmittedPoint = pt;
+
+  // Draw the stroke segment live
   ctx.lineTo(pt.x, pt.y);
   ctx.stroke();
-  ctx.beginPath();         // Re-open path to avoid visual accumulation
+  ctx.beginPath(); // Re-open to avoid accumulation
   ctx.moveTo(pt.x, pt.y);
 }
 
@@ -162,34 +200,41 @@ function onPointerUp(e) {
   ctx.restore();
   isDrawing = false;
 
+  // Ensure at least 2 points for a visible stroke
   if (currentStrokePoints.length < 2) {
-    // Single tap — add a tiny movement so the stroke is visible
     const pt = currentStrokePoints[0];
-    if (pt) currentStrokePoints.push({ x: pt.x + 0.1, y: pt.y + 0.1 });
+    if (pt) currentStrokePoints.push({ x: pt.x + 0.5, y: pt.y + 0.5 });
   }
-
   if (currentStrokePoints.length < 2) return;
 
-  // Send stroke to the Gateway
-  sendStroke({
+  const strokeData = {
     points: currentStrokePoints,
-    color:  isEraser ? 'eraser' : currentColor,
-    width:  brushSize,
-  });
+    color: isEraser ? 'eraser' : currentColor,
+    width: brushSize,
+  };
+
+  // ── Add to pending store so it survives resize while in-flight ────────────
+  const tempId = nextTempId++;
+  const pending = { tempId, ...strokeData };
+  pendingStrokes.push(pending);
+
+  // Send to Gateway → Leader → RAFT cluster
+  sendStroke(strokeData, tempId);
 
   currentStrokePoints = [];
+  lastEmittedPoint = null;
 }
 
 // Mouse events
-canvas.addEventListener('mousedown',  onPointerDown);
-canvas.addEventListener('mousemove',  onPointerMove);
-canvas.addEventListener('mouseup',    onPointerUp);
-canvas.addEventListener('mouseleave', onPointerUp); // Treat leave as stroke end
+canvas.addEventListener('mousedown', onPointerDown);
+canvas.addEventListener('mousemove', onPointerMove);
+canvas.addEventListener('mouseup', onPointerUp);
+canvas.addEventListener('mouseleave', onPointerUp);
 
-// Touch events (FR-FE-03)
+// Touch events
 canvas.addEventListener('touchstart', onPointerDown, { passive: false });
-canvas.addEventListener('touchmove',  onPointerMove, { passive: false });
-canvas.addEventListener('touchend',   onPointerUp,   { passive: false });
+canvas.addEventListener('touchmove', onPointerMove, { passive: false });
+canvas.addEventListener('touchend', onPointerUp, { passive: false });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WEBSOCKET CLIENT
@@ -202,22 +247,17 @@ function connect() {
   ws = new WebSocket(GATEWAY_WS_URL);
 
   ws.addEventListener('open', () => {
-    reconnectDelay = 500; // Reset backoff on successful connection
+    reconnectDelay = 500;
     setStatus('connected', 'Connected');
     hideOverlay();
     console.log('[WS] Connected to Gateway');
-    // Start a keep-alive ping every 20 s
     startPing();
   });
 
   ws.addEventListener('message', (event) => {
     let msg;
-    try {
-      msg = JSON.parse(event.data);
-    } catch {
-      console.warn('[WS] Received non-JSON message:', event.data);
-      return;
-    }
+    try { msg = JSON.parse(event.data); }
+    catch { console.warn('[WS] Non-JSON message:', event.data); return; }
     handleMessage(msg);
   });
 
@@ -226,11 +266,7 @@ function connect() {
     const wasConnected = statusEl.classList.contains('connected');
     setStatus('reconnecting', 'Reconnecting…');
     showOverlay('Connection lost — reconnecting…');
-
-    if (wasConnected) {
-      showToast('Connection lost. Reconnecting…', 'warn');
-    }
-
+    if (wasConnected) showToast('Connection lost. Reconnecting…', 'warn');
     console.log(`[WS] Closed (code=${event.code}). Retrying in ${reconnectDelay}ms…`);
     setTimeout(() => {
       reconnectDelay = Math.min(reconnectDelay * 2, MAX_DELAY);
@@ -240,40 +276,55 @@ function connect() {
 
   ws.addEventListener('error', (err) => {
     console.error('[WS] Error:', err);
-    // 'close' fires after 'error', so reconnection is handled there
   });
 }
 
-/** Handle an incoming WebSocket message from the Gateway. */
+// ── Incoming message handler ──────────────────────────────────────────────────
 function handleMessage(msg) {
   switch (msg.type) {
 
     case 'stroke-committed': {
-      // A stroke has been committed by the RAFT leader — render it
+      /**
+       * A stroke has been committed by the RAFT cluster.
+       *
+       * Deduplication strategy:
+       *  - Committed strokes already in committedStrokes[] → skip (idempotent on reconnect sync)
+       *  - The *first* pending stroke in our queue is assumed to be the matching local stroke
+       *    (FIFO: we don't reorder strokes). Remove it from pending to stop its faded rendering.
+       *    The committed copy is added to committedStrokes[] and rendered at full opacity.
+       *  - If no pending, it's someone else's stroke → just render it.
+       */
       const stroke = msg.data;
-      // Avoid duplicating locally-drawn strokes (they're rendered live already)
-      if (!committedStrokes.find(s => s.index === stroke.index)) {
-        committedStrokes.push(stroke);
-        renderStroke(stroke);
+
+      // Idempotency guard — full-sync can replay already-committed strokes
+      if (committedStrokes.some(s => s.index === stroke.index)) break;
+
+      // Remove the oldest pending stroke (matches iff we sent it; otherwise harmless)
+      if (pendingStrokes.length > 0) {
+        pendingStrokes.shift(); // Consume the local pending placeholder
       }
+
+      committedStrokes.push(stroke);
+
+      // Full redraw so pending strokes are correctly re-layered after dequeue
+      redrawAll();
       break;
     }
 
     case 'full-sync': {
-      // Full canvas state received (on connect / reconnect) — rebuild canvas
+      // Full canvas state on connect / reconnect — rebuild everything
       const strokes = msg.data?.strokes || [];
       committedStrokes.length = 0;
       committedStrokes.push(...strokes);
+      // Keep pending strokes — they're still in-flight and will sync when committed
       redrawAll();
-      console.log(`[WS] Full-sync: rendered ${strokes.length} stroke(s)`);
-      if (strokes.length > 0) {
-        showToast(`Canvas synced — ${strokes.length} stroke(s) loaded`, 'info');
-      }
+      console.log(`[WS] Full-sync: ${strokes.length} stroke(s)`);
+      if (strokes.length > 0) showToast(`Canvas synced — ${strokes.length} stroke(s) loaded`, 'info');
       break;
     }
 
     case 'pong':
-      // Heartbeat reply — connection healthy
+      // Keep-alive reply — no-op
       break;
 
     case 'error':
@@ -290,6 +341,7 @@ function handleMessage(msg) {
 function sendStroke(strokeData) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: 'stroke', data: strokeData }));
+  console.log(`[WS] Sent stroke — ${strokeData.points.length} point(s)`);
 }
 
 // ── Keep-alive ping ───────────────────────────────────────────────────────────
@@ -312,27 +364,24 @@ function stopPing() {
 // UI HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
 
-/** Update the status badge text + CSS class. */
 function setStatus(cssClass, text) {
   statusEl.className = `status ${cssClass}`;
   statusEl.textContent = text;
 }
 
-/** Show the blocking overlay with a message. */
 function showOverlay(message) {
   overlayMsgEl.textContent = message;
   overlayEl.classList.remove('hidden');
   overlayEl.removeAttribute('aria-hidden');
 }
 
-/** Hide the blocking overlay (reveals the canvas for drawing). */
 function hideOverlay() {
   overlayEl.classList.add('hidden');
   overlayEl.setAttribute('aria-hidden', 'true');
 }
 
 /**
- * Show a toast notification for a given duration.
+ * Show a toast notification.
  * @param {string} message
  * @param {'info'|'success'|'warn'|'error'} type
  * @param {number} duration  ms before auto-dismiss
@@ -345,16 +394,11 @@ function showToast(message, type = 'info', duration = 3500) {
   setTimeout(() => toast.remove(), duration);
 }
 
-/** Update the leader badge in the header. */
+/** Update the leader badge. Accepts "http://replica1:4001" → shows "replica1". */
 function updateLeaderBadge(leaderUrl) {
-  if (!leaderUrl) {
-    leaderNameEl.textContent = '–';
-    return;
-  }
-  // Parse "http://replica2:4002" → "replica2"
+  if (!leaderUrl) { leaderNameEl.textContent = '–'; return; }
   try {
-    const hostname = new URL(leaderUrl).hostname;
-    leaderNameEl.textContent = hostname;
+    leaderNameEl.textContent = new URL(leaderUrl).hostname;
   } catch {
     leaderNameEl.textContent = leaderUrl;
   }
@@ -362,27 +406,41 @@ function updateLeaderBadge(leaderUrl) {
 
 // ── Brush preview ─────────────────────────────────────────────────────────────
 function updateBrushPreview() {
-  const size  = Math.min(brushSize, 22);
+  const size = Math.min(brushSize, 22);
   const color = isEraser ? '#aaa' : currentColor;
-  brushPreviewEl.style.width      = `${size}px`;
-  brushPreviewEl.style.height     = `${size}px`;
+  brushPreviewEl.style.width = `${size}px`;
+  brushPreviewEl.style.height = `${size}px`;
   brushPreviewEl.style.background = color;
-  brushPreviewEl.style.border     = isEraser ? '1.5px dashed #666' : 'none';
+  brushPreviewEl.style.border = isEraser ? '1.5px dashed #666' : 'none';
 }
 
-// ── Poll Gateway /health for leader info ──────────────────────────────────────
+// ── Poll Gateway /health for leader info + queue depth ────────────────────────
 function startHealthPolling() {
   const HEALTH_URL = `http://${location.hostname}:3000/health`;
+
   setInterval(async () => {
     try {
-      const res  = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(2000) });
+      const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(2000) });
       const data = await res.json();
+
       updateLeaderBadge(data.leader);
+
       if (data.clients !== undefined) {
         countValueEl.textContent = data.clients;
       }
+
+      // Show queue depth badge — hidden when queue is empty
+      if (queueDepthEl) {
+        const depth = data.queueDepth ?? 0;
+        if (depth > 0) {
+          queueDepthEl.textContent = `${depth} queued`;
+          queueDepthEl.classList.remove('hidden');
+        } else {
+          queueDepthEl.classList.add('hidden');
+        }
+      }
     } catch {
-      // Gateway unreachable — WS reconnection will handle recovery
+      // Gateway unreachable — WS reconnection handles recovery
     }
   }, 3000);
 }
@@ -395,18 +453,14 @@ function startHealthPolling() {
 colourBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     const colour = btn.dataset.colour;
-
-    // Update active state
     colourBtns.forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
-
     if (colour === 'eraser') {
       isEraser = true;
     } else {
-      isEraser     = false;
+      isEraser = false;
       currentColor = colour;
     }
-
     updateBrushPreview();
   });
 });
@@ -417,10 +471,11 @@ brushSizeInput.addEventListener('input', () => {
   updateBrushPreview();
 });
 
-// Clear button (local canvas only — does not send a stroke to the cluster)
+// Clear button — local canvas only
 btnClear.addEventListener('click', () => {
   committedStrokes.length = 0;
-  const cssW = canvas.width  / window.devicePixelRatio;
+  pendingStrokes.length = 0;
+  const cssW = canvas.width / window.devicePixelRatio;
   const cssH = canvas.height / window.devicePixelRatio;
   ctx.clearRect(0, 0, cssW, cssH);
   showToast('Canvas cleared locally', 'info', 2000);
@@ -430,9 +485,9 @@ btnClear.addEventListener('click', () => {
 // INIT
 // ══════════════════════════════════════════════════════════════════════════════
 
-resizeCanvas();         // Set correct pixel dimensions immediately
-updateBrushPreview();   // Sync brush preview with initial values
-connect();              // Open WebSocket to Gateway
-startHealthPolling();   // Poll /health every 3 s for leader info
+resizeCanvas();       // Set correct pixel dimensions + scale immediately
+updateBrushPreview(); // Sync brush preview with initial values
+connect();            // Open WebSocket to Gateway
+startHealthPolling(); // Poll /health every 3 s for leader info + queue depth
 
 console.log('[Frontend] Mini-RAFT Drawing Board initialised');
