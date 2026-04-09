@@ -23,11 +23,11 @@ const WsTestClient = require('../helpers/wsClient');
 // ─── Endpoints ────────────────────────────────────────────────────────────────
 
 const BASE = {
-  r1: 'http://localhost:4001',
-  r2: 'http://localhost:4002',
-  r3: 'http://localhost:4003',
-  gw: 'http://localhost:3000',
-  ws: 'ws://localhost:3000',
+  r1: 'http://127.0.0.1:4001',
+  r2: 'http://127.0.0.1:4002',
+  r3: 'http://127.0.0.1:4003',
+  gw: 'http://127.0.0.1:3000',
+  ws: 'ws://127.0.0.1:3000',
 };
 
 // Docker container names (compose project = directory name, lowercased + stripped)
@@ -429,7 +429,7 @@ describe('[IT-5] Catch-up on restart', () => {
       // 3. Draw 5 strokes to the leader while follower is down
       for (let i = 0; i < 5; i++) {
         await axios.post(
-          `http://localhost:${leaderPort}/client-stroke`,
+          `http://127.0.0.1:${leaderPort}/client-stroke`,
           { stroke: mkStroke(`color-${i}`) },
           { timeout: 3000 }
         );
@@ -437,7 +437,7 @@ describe('[IT-5] Catch-up on restart', () => {
 
       // Verify leader has 5+ new entries
       const midLeader = await axios.get(
-        `http://localhost:${leaderPort}/status`,
+        `http://127.0.0.1:${leaderPort}/status`,
         { timeout: 2000 }
       );
       const targetLogLength = midLeader.data.logLength;
