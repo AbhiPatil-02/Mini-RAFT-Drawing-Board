@@ -260,6 +260,22 @@ describe('handleHeartbeat()', () => {
     raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 0 });
     expect(raft.getStatus().commitIndex).toBe(ci1);
   });
+
+  test('includes logLength in the success response so the leader can detect lagging followers', () => {
+    log.append(1, stroke('a'));
+    log.append(1, stroke('b'));
+
+    const result = raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 0 });
+
+    expect(result.success).toBe(true);
+    expect(result.logLength).toBe(2); // follower reports its current log size
+  });
+
+  test('logLength in response is 0 when the log is empty (restarted node)', () => {
+    // Fresh start — log is empty
+    const result = raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 0 });
+    expect(result.logLength).toBe(0);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -451,6 +467,139 @@ describe('handleSyncLog()', () => {
     const result = raft.handleSyncLog({ ...baseSync, entries });
     expect(result.logLength).toBe(2);
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sendHeartbeats() — proactive catch-up: trigger /sync-log for lagging followers
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('sendHeartbeats() — proactive sync-log trigger', () => {
+  /**
+   * Helper: drive the node to Leader state via fake timers + mocked votes.
+   * After this returns, state === 'Leader', currentTerm === 1, commitIndex === 0.
+   */
+  async function driveToLeader() {
+    axiosMock.post.mockResolvedValue({ data: { term: 1, voteGranted: true, success: true } });
+    raft.start();
+    // t=0 jitter fires becomeFollower(0) → sets election timer (500-800 ms)
+    // t=900 election fires → wins → becomeLeader → immediate sendHeartbeats
+    await jest.advanceTimersByTimeAsync(900);
+    expect(raft.getStatus().state).toBe('Leader');
+  }
+
+  /**
+   * Helper: commit one stroke as Leader so commitIndex becomes 1.
+   * Uses a mock that makes both peers ACK immediately.
+   */
+  async function commitOneStroke(color = 'red') {
+    axiosMock.post.mockResolvedValue({ data: { success: true, term: 1 } });
+    const result = await raft.handleClientStroke(stroke(color));
+    expect(result.success).toBe(true);
+    expect(raft.getStatus().commitIndex).toBe(1);
+  }
+
+  // ─── Tests ─────────────────────────────────────────────────────────────────
+
+  test(
+    'triggers /sync-log for a lagging follower detected via heartbeat response',
+    async () => {
+      await driveToLeader();
+      await commitOneStroke('red');        // commitIndex = 1
+
+      // Followers report logLength=0 (restarted / behind) in the next heartbeat reply
+      axiosMock.post.mockClear();
+      axiosMock.post.mockResolvedValue({ data: { term: 1, success: true, logLength: 0 } });
+
+      // Advance 150 ms → one heartbeat interval fires
+      await jest.advanceTimersByTimeAsync(150);
+
+      // At least one peer must have received /sync-log
+      const syncCalls = axiosMock.post.mock.calls.filter(
+        ([url]) => url && url.includes('/sync-log')
+      );
+      expect(syncCalls.length).toBeGreaterThan(0);
+
+      // The /sync-log payload must include the committed entry and correct leaderCommit
+      const [, body] = syncCalls[0];
+      expect(body.entries).toHaveLength(1);    // the one committed stroke
+      expect(body.leaderCommit).toBe(1);       // leader's known commitIndex
+    }
+  );
+
+  test(
+    'triggers /sync-log for BOTH peers when both are lagging',
+    async () => {
+      await driveToLeader();
+      await commitOneStroke('blue');
+
+      axiosMock.post.mockClear();
+      axiosMock.post.mockResolvedValue({ data: { term: 1, success: true, logLength: 0 } });
+
+      await jest.advanceTimersByTimeAsync(150);
+
+      const syncCalls = axiosMock.post.mock.calls.filter(
+        ([url]) => url && url.includes('/sync-log')
+      );
+      // 2 peers × 1 /sync-log each
+      expect(syncCalls.length).toBe(2);
+    }
+  );
+
+  test(
+    'does NOT trigger /sync-log when followers are already up-to-date',
+    async () => {
+      await driveToLeader();
+      await commitOneStroke();
+
+      axiosMock.post.mockClear();
+      // Followers report logLength === commitIndex (up-to-date)
+      axiosMock.post.mockResolvedValue({ data: { term: 1, success: true, logLength: 1 } });
+
+      await jest.advanceTimersByTimeAsync(150);
+
+      const syncCalls = axiosMock.post.mock.calls.filter(
+        ([url]) => url && url.includes('/sync-log')
+      );
+      expect(syncCalls).toHaveLength(0);
+    }
+  );
+
+  test(
+    'does NOT trigger /sync-log when heartbeat response has no logLength field (older replicas)',
+    async () => {
+      await driveToLeader();
+      await commitOneStroke();
+
+      axiosMock.post.mockClear();
+      // Response without logLength — type-guard must suppress sync
+      axiosMock.post.mockResolvedValue({ data: { term: 1, success: true } });
+
+      await jest.advanceTimersByTimeAsync(150);
+
+      const syncCalls = axiosMock.post.mock.calls.filter(
+        ([url]) => url && url.includes('/sync-log')
+      );
+      expect(syncCalls).toHaveLength(0);
+    }
+  );
+
+  test(
+    'does NOT trigger /sync-log when commitIndex is 0 (no strokes committed yet)',
+    async () => {
+      await driveToLeader(); // commitIndex = 0 at this point
+
+      axiosMock.post.mockClear();
+      // Even if follower reports logLength=0, 0 < 0 is false — no sync needed
+      axiosMock.post.mockResolvedValue({ data: { term: 1, success: true, logLength: 0 } });
+
+      await jest.advanceTimersByTimeAsync(150);
+
+      const syncCalls = axiosMock.post.mock.calls.filter(
+        ([url]) => url && url.includes('/sync-log')
+      );
+      expect(syncCalls).toHaveLength(0);
+    }
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
