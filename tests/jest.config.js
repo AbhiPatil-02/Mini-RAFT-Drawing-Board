@@ -18,9 +18,10 @@ module.exports = {
     '<rootDir>/node_modules',
   ],
   moduleDirectories: ['node_modules'],
-  // Remap bare 'axios' to the local tests copy regardless of which folder
-  // the requiring module lives in
+  // Remap bare 'axios' to its CJS build so Jest (CommonJS mode) can load it.
+  // axios@1.x ships index.js as ESM but provides a proper CJS bundle at
+  // dist/node/axios.cjs — point there to avoid "Cannot use import statement" errors.
   moduleNameMapper: {
-    '^axios$': '<rootDir>/node_modules/axios/index.js',
+    '^axios$': '<rootDir>/node_modules/axios/dist/node/axios.cjs',
   },
 };

@@ -47,12 +47,16 @@ async function pollUntil(fn, timeoutMs, intervalMs = 300) {
  */
 async function pollClusterUntil(axios, BASE, predicate, timeoutMs = 10000) {
   return pollUntil(async () => {
-    const [r1, r2, r3] = await Promise.all([
+    // Use allSettled so a stopped/crashed replica doesn't abort the entire poll.
+    // The predicate only sees statuses from replicas that are currently reachable.
+    const results = await Promise.allSettled([
       axios.get(`${BASE.r1}/status`, { timeout: 2000 }).then(r => r.data),
       axios.get(`${BASE.r2}/status`, { timeout: 2000 }).then(r => r.data),
       axios.get(`${BASE.r3}/status`, { timeout: 2000 }).then(r => r.data),
     ]);
-    const statuses = [r1, r2, r3];
+    const statuses = results
+      .filter(r => r.status === 'fulfilled')
+      .map(r => r.value);
     return predicate(statuses) ? statuses : null;
   }, timeoutMs);
 }
@@ -78,9 +82,10 @@ function exec(cmd) {
  */
 async function isClusterUp(axios, BASE) {
   try {
-    await axios.get(`${BASE.r1}/status`, { timeout: 2000 });
+    await axios.get(`${BASE.r1}/status`, { timeout: 4000 });
     return true;
-  } catch {
+  } catch (err) {
+    console.warn(`[isClusterUp] Could not reach ${BASE.r1}/status — ${err.code || err.message}`);
     return false;
   }
 }

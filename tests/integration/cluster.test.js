@@ -52,20 +52,41 @@ beforeAll(async () => {
   }
 }, 10_000);
 
-/** Wrap each test so it skips gracefully when cluster is not running */
+/**
+ * Wrap each test so it skips gracefully when cluster is not running.
+ *
+ * IMPORTANT: `clusterRunning` must be checked at test *execution* time,
+ * not at test *registration* time.  All it_cluster() calls happen
+ * synchronously while the module is parsed — before beforeAll() ever runs —
+ * so `clusterRunning` is always `false` at that point.  Wrapping the check
+ * inside the test body defers evaluation until after beforeAll() has set
+ * `clusterRunning` to its real value.
+ */
 function it_cluster(name, fn, timeout) {
-  (clusterRunning ? test : test.skip)(name, fn, timeout);
+  test(name, async (...args) => {
+    if (!clusterRunning) {
+      console.warn(`[SKIP] "${name}" — cluster not reachable, skipping.`);
+      return; // test passes as a no-op; cluster tests only run when docker is up
+    }
+    return fn(...args);
+  }, timeout);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Return the status of all 3 replicas as an array. */
+/**
+ * Return the status of all reachable replicas as an array.
+ * Uses allSettled so a restarting/stopped replica doesn't abort the call.
+ */
 async function allStatuses() {
-  return Promise.all([
+  const results = await Promise.allSettled([
     axios.get(`${BASE.r1}/status`, { timeout: 3000 }).then(r => r.data),
     axios.get(`${BASE.r2}/status`, { timeout: 3000 }).then(r => r.data),
     axios.get(`${BASE.r3}/status`, { timeout: 3000 }).then(r => r.data),
   ]);
+  return results
+    .filter(r => r.status === 'fulfilled')
+    .map(r => r.value);
 }
 
 /** Return the status object of whichever replica is currently the Leader. */
@@ -181,6 +202,15 @@ describe('[IT-3] Stroke replication', () => {
   it_cluster(
     'POST stroke to leader → all 3 replicas have matching logLength',
     async () => {
+      // 0. Wait for the cluster to fully stabilize after any previous container
+      //    restarts (e.g. IT-2 restarts the old leader, which can trigger a
+      //    second brief election before IT-3 starts).
+      await pollClusterUntil(
+        axios, BASE,
+        (ss) => ss.length === 3 && ss.filter(s => s.state === 'Leader').length === 1,
+        10_000
+      );
+
       // 1. Identify leader
       const before    = await allStatuses();
       const logBefore = before[0].logLength;
@@ -384,7 +414,12 @@ describe('[IT-5] Catch-up on restart', () => {
       const follower = initial.find(s => s.state === 'Follower');
       expect(follower).toBeDefined();
 
-      stoppedContainer = CONTAINERS[follower.id] || CONTAINERS.r2;
+      // CONTAINERS keys are 'r1'/'r2'/'r3' but follower.id is 'replica1'/'replica2'/'replica3'.
+      // Search by substring match (same pattern used in IT-2) to get the right container.
+      const followerKey = Object.keys(CONTAINERS).find(
+        k => CONTAINERS[k].includes(follower.id)
+      );
+      stoppedContainer = CONTAINERS[followerKey] || CONTAINERS.r2;
       const leaderPort = { replica1: 4001, replica2: 4002, replica3: 4003 }[leader.id];
 
       // 2. Stop the follower
