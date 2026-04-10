@@ -1,0 +1,466 @@
+/* =============================================================================
+   Mini-RAFT Drawing Board — Styles
+   Design: dark glassmorphism header, white canvas, smooth micro-interactions
+   ============================================================================= */
+
+/* ── Google Fonts fallback ─────────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* ── Reset & base ──────────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg-deep: #0d0d1a;
+  --bg-header: #12122b;
+  --bg-card: #1a1a3a;
+  --border: rgba(255, 255, 255, 0.08);
+  --accent: #7c6ff7;
+  --accent-glow: rgba(124, 111, 247, 0.35);
+  --red: #e94560;
+  --green: #4ade80;
+  --yellow: #fbbf24;
+  --text-primary: #f0f0ff;
+  --text-muted: #8888aa;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-pill: 999px;
+  --transition: 0.18s ease;
+  --header-h: 56px;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+/* Utility */
+.hidden {
+  display: none !important;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 14px;
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
+#app-header {
+  height: var(--header-h);
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0 1.25rem;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  flex-shrink: 0;
+  z-index: 10;
+}
+
+/* Left: logo + leader badge */
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+}
+
+.logo-icon {
+  font-size: 1.3rem;
+  color: var(--accent);
+  filter: drop-shadow(0 0 6px var(--accent-glow));
+}
+
+.logo h1 {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.02em;
+}
+
+.header-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.6rem;
+  background: rgba(124, 111, 247, 0.12);
+  border: 1px solid rgba(124, 111, 247, 0.25);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+
+/* Center: toolbar */
+.header-center {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  min-width: 0;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.75rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+}
+
+.tool-group {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.tool-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+  margin: 0 0.25rem;
+}
+
+/* Right: status */
+.header-right {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.connection-info {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* ── Labels / meta text ────────────────────────────────────────────────────── */
+.meta-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.meta-value {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Status pill ───────────────────────────────────────────────────────────── */
+.status {
+  padding: 0.28rem 0.75rem;
+  border-radius: var(--radius-pill);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  transition: background var(--transition), color var(--transition);
+  white-space: nowrap;
+}
+
+.status.connected {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--green);
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.2);
+}
+
+.status.reconnecting {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--yellow);
+  animation: pulse-badge 1.2s ease-in-out infinite;
+}
+
+.status.disconnected {
+  background: rgba(233, 69, 96, 0.15);
+  color: var(--red);
+}
+
+@keyframes pulse-badge {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* ── Client count ──────────────────────────────────────────────────────────── */
+.client-count {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.count-icon {
+  font-size: 0.9rem;
+}
+
+/* ── Stroke queue depth badge (shown during leader failover) ───────────────── */
+.queue-badge {
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--radius-pill);
+  font-size: 0.63rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: rgba(251, 146, 60, 0.18);
+  color: #fb923c;
+  border: 1px solid rgba(251, 146, 60, 0.35);
+  animation: pulse-badge 1.2s ease-in-out infinite;
+  white-space: nowrap;
+}
+
+/* ── Colour swatches ───────────────────────────────────────────────────────── */
+.colour-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--c);
+  border: 2px solid transparent;
+  cursor: pointer;
+  transition: transform var(--transition), border-color var(--transition), box-shadow var(--transition);
+  flex-shrink: 0;
+  position: relative;
+}
+
+.colour-btn:hover {
+  transform: scale(1.2);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.15);
+}
+
+.colour-btn.active {
+  border-color: #fff;
+  transform: scale(1.15);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.2);
+}
+
+.colour-btn.eraser-swatch {
+  background: #ffffff;
+  color: #aaa;
+  font-size: 0.7rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+}
+
+/* ── Brush size slider ─────────────────────────────────────────────────────── */
+.brush-group {
+  gap: 0.5rem;
+}
+
+#brush-size {
+  width: 80px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.brush-preview {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #1e1e2e;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+  transition: width var(--transition), height var(--transition);
+}
+
+/* ── Action buttons ────────────────────────────────────────────────────────── */
+.action-btn {
+  padding: 0.3rem 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+  font-family: inherit;
+}
+
+.action-btn:hover {
+  background: rgba(233, 69, 96, 0.12);
+  border-color: var(--red);
+  color: var(--red);
+}
+
+/* ── Canvas area ───────────────────────────────────────────────────────────── */
+#canvas-container {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  background: #f8f8f8;
+}
+
+#drawing-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  touch-action: none;
+  /* Prevent scroll interference on touch devices */
+}
+
+/* ── Disconnected overlay ──────────────────────────────────────────────────── */
+.canvas-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(13, 13, 26, 0.72);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+  opacity: 1;
+  transition: opacity 0.4s ease;
+  pointer-events: all;
+}
+
+/* Hidden state: fade out + block all interaction */
+.canvas-overlay.overlay-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.overlay-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.2rem;
+  color: var(--text-primary);
+}
+
+.overlay-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid rgba(124, 111, 247, 0.2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+#overlay-message {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  text-align: center;
+}
+
+.overlay-sub {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  opacity: 0.7;
+  text-align: center;
+  margin-top: -0.4rem;
+  min-height: 1em; /* Reserve space so overlay doesn't jump */
+}
+
+/* ── Toast notifications ───────────────────────────────────────────────────── */
+#toast-container {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  z-index: 100;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 0.6rem 1rem;
+  border-radius: var(--radius-md);
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  animation: toast-in 0.25s ease forwards;
+  max-width: 260px;
+  pointer-events: none;
+}
+
+.toast.toast-info {
+  border-left: 3px solid var(--accent);
+}
+
+.toast.toast-success {
+  border-left: 3px solid var(--green);
+}
+
+.toast.toast-warn {
+  border-left: 3px solid var(--yellow);
+}
+
+.toast.toast-error {
+  border-left: 3px solid var(--red);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Responsive ────────────────────────────────────────────────────────────── */
+@media (max-width: 700px) {
+  .logo h1 {
+    display: none;
+  }
+
+  #leader-badge {
+    display: none;
+  }
+
+  #brush-size {
+    width: 55px;
+  }
+
+  .header-center {
+    flex: unset;
+  }
+}
