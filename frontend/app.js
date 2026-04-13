@@ -223,11 +223,17 @@ function onPointerUp(e) {
     width:  brushSize,
   };
 
-  // Add to pending store so it survives resize while in-flight
-  const tempId  = nextTempId++;
-  pendingStrokes.push({ tempId, ...strokeData });
-
-  sendStroke(strokeData);
+  // [BUG-8 FIX] Only add to pendingStrokes if the WS is actually open.
+  // If the socket is connecting/closed, sendStroke will be a no-op anyway,
+  // but without this guard the stroke would accumulate as a ghost pending
+  // entry that never gets resolved (no commit ACK arrives for undelivered strokes).
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const tempId  = nextTempId++;
+    pendingStrokes.push({ tempId, ...strokeData });
+    sendStroke(strokeData);
+  } else {
+    console.debug('[WS] Stroke drawn while socket not open — discarding (not added to pending)');
+  }
 
   currentStrokePoints = [];
   lastEmittedPoint    = null;
@@ -339,7 +345,11 @@ function connect() {
       showToast('Connection lost — reconnecting…', 'warn', 4000);
     }
 
-    console.log(`[WS] Closed (code=${event.code}). Retry #${reconnectCount} in ${delay}ms`);
+    // [OBS-5] Polish: show delay + attempt counter clearly for debugging
+    console.log(
+      `[WS] Closed (code=${event.code}). Retry #${reconnectCount} in ${delay}ms` +
+      ` (next cap: ${reconnectDelay}ms)`
+    );
 
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connect, delay);
@@ -654,8 +664,11 @@ function startHealthPolling() {
           queueDepthEl.classList.add('hidden');
         }
       }
-    } catch {
-      // Gateway unreachable — WS reconnection handles recovery
+    } catch (err) {
+      // [BUG-10 FIX] Gateway unreachable — log at debug level so dev tools
+      // show gateway restarts without flooding the console during normal operation.
+      console.debug(`[Health] Gateway poll failed: ${err.message}`);
+      // WS reconnection handles recovery — no action needed here
     }
   }, 3000);
 }

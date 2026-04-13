@@ -11,6 +11,8 @@
  *  POST /client-stroke   — Gateway forwards a client stroke (Leader only)
  *  GET  /status          — Current RAFT state: { id, state, term, leader, logLength, commitIndex }
  *  GET  /committed-log   — All committed strokes (used by Gateway for full-sync on client connect)
+ *
+ * [OBS-4] Unknown routes return a JSON 404 (not Express's default HTML).
  */
 
 const express = require('express');
@@ -74,6 +76,21 @@ app.get('/committed-log', (req, res) => {
   const committed = log.getCommitted();
   const strokes   = committed.map(e => ({ index: e.index, ...e.stroke }));
   res.json({ strokes });
+});
+
+// ── 404 catch-all ────────────────────────────────────────────────────────────
+
+/**
+ * [OBS-4] Return structured JSON for any unmatched route so callers get a
+ * machine-readable error instead of Express's default HTML 404 page.
+ */
+// eslint-disable-next-line no-unused-vars
+app.use((req, res) => {
+  const ts = new Date().toISOString();
+  console.log(
+    `${ts} [WARN ][${config.REPLICA_ID}] 404 ${req.method} ${req.path}`
+  );
+  res.status(404).json({ success: false, error: `Unknown route: ${req.method} ${req.path}` });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────

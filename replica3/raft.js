@@ -8,7 +8,7 @@
  *  ✓ becomeCandidate()       — increment term, vote for self, stop heartbeats
  *  ✓ becomeLeader()          — start heartbeat interval, send immediate heartbeat
  *  ✓ startElection()         — parallel RequestVote, majority check, step-down on higher term
- *  ✓ sendHeartbeats()        — POST /heartbeat to all peers; step down if higher term seen
+ *  ✓ sendHeartbeats()        — POST /heartbeat to ALL peers in PARALLEL; step down if higher term seen
  *  ✓ handleRequestVote()     — full log-up-to-date check (lastLogTerm + lastLogIndex)
  *  ✓ handleHeartbeat()       — reset timer, update term, advance commitIndex
  *  ✓ handleAppendEntries()   — consistency check, conflict truncation, append, advance commitIndex
@@ -16,11 +16,29 @@
  *  ✓ handleSyncLog()         — bulk catch-up: append all missing entries from leader
  *  ✓ triggerSyncLog()        — leader sends missing entries to a lagging follower
  *  ✓ notifyGateway()         — POST /broadcast to Gateway after commit
+ *
+ * Fix log (audit):
+ *  [BUG-2] sendHeartbeats: sequential for-of+await → parallel Promise.allSettled
+ *          (prevents false elections when one peer is slow)
+ *  [BUG-1] handleClientStroke: leaderCommit in AppendEntries now uses post-commit
+ *          entry.index so followers commit the entry immediately, not after next heartbeat
+ *  [OBS-1] All log lines now carry an ISO-8601 timestamp prefix
+ *  [OBS-2] Explicit [INFO] / [WARN] / [ERROR] severity tags throughout
+ *  [OBS-7] sendHeartbeats emits a summary log when any peer is lagging
  */
 
 const axios  = require('axios');
 const config = require('./config');
 const log    = require('./log');
+
+// ── Structured logger ─────────────────────────────────────────────────────────
+// All log lines carry an ISO timestamp + replica ID + severity tag so that
+// docker logs across replicas can be correlated and grepped by level.
+const _ts   = () => new Date().toISOString();
+const rlog  = (level, msg) => console.log(`${_ts()} [${level}][RAFT][${config.REPLICA_ID}] ${msg}`);
+const info  = (msg) => rlog('INFO ', msg);
+const warn  = (msg) => rlog('WARN ', msg);
+const error = (msg) => rlog('ERROR', msg);
 
 // ── State variables ───────────────────────────────────────────────────────────
 let state         = 'Follower';  // 'Follower' | 'Candidate' | 'Leader'
@@ -76,8 +94,8 @@ function becomeFollower(term) {
   votedFor    = null;
   clearHeartbeatTimer();
   resetElectionTimer(); // Start waiting for a heartbeat from the leader
-  console.log(
-    `[RAFT][${config.REPLICA_ID}] → FOLLOWER  (term ${term})` +
+  info(
+    `→ FOLLOWER  (term ${term})` +
     (prev === 'Leader' ? ' [stepped down from Leader]' : '')
   );
 }
@@ -92,7 +110,7 @@ function becomeCandidate() {
   currentTerm += 1;
   votedFor    = config.REPLICA_ID; // vote for self
   clearHeartbeatTimer();
-  console.log(`[RAFT][${config.REPLICA_ID}] → CANDIDATE (term ${currentTerm})`);
+  info(`→ CANDIDATE (term ${currentTerm})`);
 }
 
 /**
@@ -105,8 +123,8 @@ function becomeLeader() {
   clearElectionTimer(); // Leaders never wait for elections
   sendHeartbeats();     // Assert authority immediately
   heartbeatTimer = setInterval(sendHeartbeats, config.HEARTBEAT_INTERVAL_MS);
-  console.log(
-    `[RAFT][${config.REPLICA_ID}] → LEADER    (term ${currentTerm})` +
+  info(
+    `→ LEADER    (term ${currentTerm})` +
     ` | cluster: ${CLUSTER_SIZE} nodes, majority: ${MAJORITY}`
   );
 }
@@ -127,7 +145,7 @@ async function startElection() {
   let votes       = 1; // Self-vote already recorded in becomeCandidate()
   let steppedDown = false;
 
-  console.log(`[RAFT][${config.REPLICA_ID}] Requesting votes from ${config.PEERS.length} peer(s)...`);
+  info(`Requesting votes from ${config.PEERS.length} peer(s)...`);
 
   const voteRequests = config.PEERS.map(async (peer) => {
     try {
@@ -140,7 +158,7 @@ async function startElection() {
 
       if (res.data.term > currentTerm) {
         // Discovered a higher term — revert immediately
-        console.log(`[RAFT][${config.REPLICA_ID}] Higher term (${res.data.term}) from ${peer} — stepping down`);
+        info(`Higher term (${res.data.term}) from ${peer} — stepping down`);
         becomeFollower(res.data.term);
         steppedDown = true;
         return;
@@ -148,12 +166,12 @@ async function startElection() {
 
       if (res.data.voteGranted) {
         votes += 1;
-        console.log(`[RAFT][${config.REPLICA_ID}] Vote granted by ${peer} (total: ${votes})`);
+        info(`Vote granted by ${peer} (total: ${votes})`);
       } else {
-        console.log(`[RAFT][${config.REPLICA_ID}] Vote denied  by ${peer}`);
+        info(`Vote denied  by ${peer}`);
       }
     } catch {
-      console.warn(`[RAFT][${config.REPLICA_ID}] RequestVote → ${peer} unreachable / timed out`);
+      warn(`RequestVote → ${peer} unreachable / timed out`);
     }
   });
 
@@ -167,8 +185,8 @@ async function startElection() {
     becomeLeader();
   } else {
     // Split vote — revert; random election timeout will trigger another attempt
-    console.log(
-      `[RAFT][${config.REPLICA_ID}] Election failed — votes: ${votes}/${MAJORITY} needed. Retrying after next timeout.`
+    warn(
+      `Election failed — votes: ${votes}/${MAJORITY} needed. Retrying after next timeout.`
     );
     becomeFollower(currentTerm);
   }
@@ -177,44 +195,57 @@ async function startElection() {
 // ── Heartbeat Sender (Leader → Followers) ─────────────────────────────────────
 
 /**
- * Broadcasts heartbeats to all peers to suppress their election timers.
- * Also detects any node with a higher term and steps down immediately.
+ * Broadcasts heartbeats to all peers IN PARALLEL to suppress their election timers.
+ * Using Promise.allSettled prevents one slow/dead peer from blocking heartbeats
+ * to the others — eliminating false elections when a single peer has high latency.
+ *
+ * [BUG-2 FIX] Was: sequential for-of + await (caused false elections under load)
+ *             Now: parallel Promise.allSettled (all peers notified in one RTT)
  */
 async function sendHeartbeats() {
   if (state !== 'Leader') return;
 
-  for (const peer of config.PEERS) {
-    try {
-      const res = await axios.post(`${peer}/heartbeat`, {
-        term:         currentTerm,
-        leaderId:     config.REPLICA_ID,
-        leaderCommit: commitIndex,
-      }, { timeout: config.RPC_TIMEOUT_MS });
+  const laggingPeers = [];
 
-      if (res.data.term > currentTerm) {
-        console.log(`[RAFT][${config.REPLICA_ID}] Higher term (${res.data.term}) in heartbeat reply from ${peer} — stepping down`);
-        becomeFollower(res.data.term);
-        return; // Stop sending once we've stepped down
-      }
+  await Promise.allSettled(
+    config.PEERS.map(async (peer) => {
+      try {
+        const res = await axios.post(`${peer}/heartbeat`, {
+          term:         currentTerm,
+          leaderId:     config.REPLICA_ID,
+          leaderCommit: commitIndex,
+        }, { timeout: config.RPC_TIMEOUT_MS });
 
-      // Proactive catch-up: if the follower's log is behind our commitIndex, send it
-      // the missing entries immediately — without waiting for an AppendEntries rejection.
-      // This is the key mechanism that makes a restarted node catch up automatically
-      // even when no new strokes arrive from clients.
-      if (
-        res.data.success &&
-        typeof res.data.logLength === 'number' &&
-        res.data.logLength < commitIndex
-      ) {
-        console.log(
-          `[RAFT][${config.REPLICA_ID}] ${peer} is lagging` +
-          ` (logLength=${res.data.logLength} < commitIndex=${commitIndex}) — proactive /sync-log`
-        );
-        triggerSyncLog(peer, res.data.logLength).catch(() => {});
+        if (res.data.term > currentTerm) {
+          info(`Higher term (${res.data.term}) in heartbeat reply from ${peer} — stepping down`);
+          becomeFollower(res.data.term);
+          return;
+        }
+
+        // Proactive catch-up: if the follower's log is behind our commitIndex, send it
+        // the missing entries immediately — without waiting for an AppendEntries rejection.
+        // This is the key mechanism that makes a restarted node catch up automatically
+        // even when no new strokes arrive from clients.
+        if (
+          res.data.success &&
+          typeof res.data.logLength === 'number' &&
+          res.data.logLength < commitIndex
+        ) {
+          laggingPeers.push(`${peer}(logLen=${res.data.logLength})`);
+          triggerSyncLog(peer, res.data.logLength).catch(() => {});
+        }
+      } catch {
+        // Peer unreachable — it will eventually time out and start an election itself
+        // Intentionally silent: don't spam logs on every missed heartbeat pulse
       }
-    } catch {
-      // Peer unreachable — it will eventually time out and start an election itself
-    }
+    })
+  );
+
+  // [OBS-7] Log a single summary line when any peer is lagging (avoids per-peer spam)
+  if (laggingPeers.length > 0) {
+    info(
+      `Lagging peer(s) detected (commitIndex=${commitIndex}): ${laggingPeers.join(', ')} — /sync-log triggered`
+    );
   }
 }
 
@@ -250,10 +281,10 @@ function handleRequestVote(body) {
   if (voteGranted) {
     votedFor = candidateId;
     resetElectionTimer(); // Valid candidate — reset our timer
-    console.log(`[RAFT][${config.REPLICA_ID}] ✓ Voted for ${candidateId} in term ${term}`);
+    info(`✓ Voted for ${candidateId} in term ${term}`);
   } else {
-    console.log(
-      `[RAFT][${config.REPLICA_ID}] ✗ Denied vote for ${candidateId} in term ${term}` +
+    info(
+      `✗ Denied vote for ${candidateId} in term ${term}` +
       ` (votedFor=${votedFor}, logUpToDate=${logUpToDate})`
     );
   }
@@ -292,7 +323,7 @@ function handleHeartbeat(body) {
       log.commit(i);
     }
     commitIndex = newCommit;
-    console.log(`[RAFT][${config.REPLICA_ID}] commitIndex → ${commitIndex} (via heartbeat from ${leaderId})`);
+    info(`commitIndex → ${commitIndex} (via heartbeat from ${leaderId})`);
   }
 
   // Return logLength so the leader can detect if we are lagging and trigger /sync-log
@@ -333,8 +364,8 @@ function handleAppendEntries(body) {
 
     if (!prevEntry) {
       // We don't have the expected previous entry — we're behind
-      console.log(
-        `[RAFT][${config.REPLICA_ID}] Missing prevLogIndex=${prevLogIndex}` +
+      warn(
+        `Missing prevLogIndex=${prevLogIndex}` +
         ` — need sync (our logLength=${log.length})`
       );
       return { term: currentTerm, success: false, logLength: log.length };
@@ -342,8 +373,8 @@ function handleAppendEntries(body) {
 
     if (prevEntry.term !== prevLogTerm) {
       // Log divergence — let leader trigger sync-log
-      console.log(
-        `[RAFT][${config.REPLICA_ID}] Log conflict at index=${prevLogIndex}:` +
+      warn(
+        `Log conflict at index=${prevLogIndex}:` +
         ` expected term ${prevLogTerm}, got ${prevEntry.term}`
       );
       return { term: currentTerm, success: false, logLength: log.length };
@@ -358,12 +389,12 @@ function handleAppendEntries(body) {
         // Conflict: truncate from this index onward (never removes committed entries)
         log.truncateFrom(entry.index);
         log.append(entry.term, entry.stroke);
-        console.log(`[RAFT][${config.REPLICA_ID}] Conflict at index=${entry.index} — truncated and re-appended`);
+        warn(`Conflict at index=${entry.index} — truncated and re-appended`);
       }
       // else: identical entry already present — idempotent, no-op
     } else {
       log.append(entry.term, entry.stroke);
-      console.log(`[RAFT][${config.REPLICA_ID}] Appended entry index=${entry.index}, term=${entry.term}`);
+      info(`Appended entry index=${entry.index}, term=${entry.term}`);
     }
   }
 
@@ -374,7 +405,7 @@ function handleAppendEntries(body) {
       log.commit(i);
     }
     commitIndex = newCommit;
-    console.log(`[RAFT][${config.REPLICA_ID}] commitIndex → ${commitIndex} (via AppendEntries from ${leaderId})`);
+    info(`commitIndex → ${commitIndex} (via AppendEntries from ${leaderId})`);
   }
 
   return { term: currentTerm, success: true };
@@ -399,17 +430,17 @@ function handleSyncLog(body) {
   currentLeader = leaderId;
   resetElectionTimer();
 
-  console.log(`[RAFT][${config.REPLICA_ID}] /sync-log: received ${entries.length} entries from ${leaderId}`);
+  info(`/sync-log: received ${entries.length} entries from ${leaderId}`);
 
   for (const e of entries) {
     const existing = log.getEntry(e.index);
     if (!existing) {
       log.append(e.term, e.stroke);
-      console.log(`[RAFT][${config.REPLICA_ID}]   sync-append  index=${e.index}, term=${e.term}`);
+      info(`  sync-append  index=${e.index}, term=${e.term}`);
     } else if (existing.term !== e.term) {
       log.truncateFrom(e.index);
       log.append(e.term, e.stroke);
-      console.log(`[RAFT][${config.REPLICA_ID}]   sync-replace index=${e.index} (term mismatch)`);
+      warn(`  sync-replace index=${e.index} (term mismatch)`);
     }
     // else: exact match already present — idempotent
   }
@@ -421,7 +452,7 @@ function handleSyncLog(body) {
       log.commit(i);
     }
     commitIndex = newCommit;
-    console.log(`[RAFT][${config.REPLICA_ID}] Post-sync commitIndex → ${commitIndex}`);
+    info(`Post-sync commitIndex → ${commitIndex}`);
   }
 
   return { success: true, logLength: log.length };
@@ -450,9 +481,7 @@ async function handleClientStroke(stroke) {
   const prevLogIndex = entry.index - 1;
   const prevLogTerm  = prevLogIndex > 0 ? (log.getEntry(prevLogIndex)?.term ?? 0) : 0;
 
-  console.log(
-    `[RAFT][${config.REPLICA_ID}] Stroke received → appended index=${entry.index}, term=${currentTerm}`
-  );
+  info(`Stroke received → appended index=${entry.index}, term=${currentTerm}`);
 
   // Step 2: Replicate to all peers in parallel
   let acks        = 1; // Leader's own append counts as an ACK
@@ -471,14 +500,16 @@ async function handleClientStroke(stroke) {
             term:   entry.term,
             stroke: entry.stroke,
           },
-          leaderCommit: commitIndex,
+          // [BUG-1 FIX] Send post-commit index so followers commit this entry
+          // immediately via AppendEntries, not waiting for the next heartbeat.
+          // Was: leaderCommit: commitIndex  (pre-commit — this entry excluded)
+          // Now: leaderCommit: entry.index  (post-commit — followers commit immediately)
+          leaderCommit: entry.index,
         }, { timeout: config.RPC_TIMEOUT_MS });
 
         if (res.data.term > currentTerm) {
           // Higher term — must step down
-          console.log(
-            `[RAFT][${config.REPLICA_ID}] Higher term (${res.data.term}) from ${peer} during replication — stepping down`
-          );
+          info(`Higher term (${res.data.term}) from ${peer} during replication — stepping down`);
           becomeFollower(res.data.term);
           steppedDown = true;
           return;
@@ -486,17 +517,17 @@ async function handleClientStroke(stroke) {
 
         if (res.data.success) {
           acks += 1;
-          console.log(`[RAFT][${config.REPLICA_ID}] ACK from ${peer} for index=${entry.index} (acks: ${acks})`);
+          info(`ACK from ${peer} for index=${entry.index} (acks: ${acks})`);
         } else {
           // Follower's log is behind — trigger sync (non-blocking, best-effort)
           const followerLen = res.data.logLength ?? 0;
-          console.warn(
-            `[RAFT][${config.REPLICA_ID}] ${peer} rejected AppendEntries (logLength=${followerLen}) — triggering /sync-log`
+          warn(
+            `${peer} rejected AppendEntries (logLength=${followerLen}) — triggering /sync-log`
           );
           triggerSyncLog(peer, followerLen).catch(() => {});
         }
       } catch {
-        console.warn(`[RAFT][${config.REPLICA_ID}] AppendEntries → ${peer} unreachable / timed out`);
+        warn(`AppendEntries → ${peer} unreachable / timed out`);
       }
     })
   );
@@ -510,9 +541,7 @@ async function handleClientStroke(stroke) {
   if (acks >= MAJORITY) {
     commitIndex = entry.index;
     log.commit(entry.index);
-    console.log(
-      `[RAFT][${config.REPLICA_ID}] ✓ Committed index=${entry.index} (acks: ${acks}/${CLUSTER_SIZE})`
-    );
+    info(`✓ Committed index=${entry.index} (acks: ${acks}/${CLUSTER_SIZE})`);
 
     // Step 4: Notify Gateway → broadcasts committed stroke to all WS clients
     await notifyGateway(entry);
@@ -521,8 +550,8 @@ async function handleClientStroke(stroke) {
   }
 
   // No quorum — entry sits uncommitted (will be resolved on sync/catch-up)
-  console.warn(
-    `[RAFT][${config.REPLICA_ID}] ✗ No quorum for index=${entry.index}` +
+  warn(
+    `✗ No quorum for index=${entry.index}` +
     ` — acks: ${acks}/${MAJORITY} needed`
   );
   return { success: false, error: 'no quorum', acks };
@@ -538,9 +567,7 @@ async function triggerSyncLog(peer, followerLogLength) {
   const missingEntries = log.getFrom(followerLogLength + 1);
   if (missingEntries.length === 0) return;
 
-  console.log(
-    `[RAFT][${config.REPLICA_ID}] Sending ${missingEntries.length} missing entries to ${peer} via /sync-log`
-  );
+  info(`Sending ${missingEntries.length} missing entries to ${peer} via /sync-log`);
 
   try {
     await axios.post(`${peer}/sync-log`, {
@@ -550,7 +577,7 @@ async function triggerSyncLog(peer, followerLogLength) {
       leaderCommit: commitIndex,
     }, { timeout: config.RPC_TIMEOUT_MS * 5 }); // Generous timeout for bulk transfers
   } catch (err) {
-    console.warn(`[RAFT][${config.REPLICA_ID}] /sync-log to ${peer} failed: ${err.message}`);
+    warn(`/sync-log to ${peer} failed: ${err.message}`);
   }
 }
 
@@ -568,31 +595,29 @@ async function notifyGateway(entry) {
         ...entry.stroke,
       },
     }, { timeout: 1000 });
-    console.log(`[RAFT][${config.REPLICA_ID}] Gateway notified — broadcast index=${entry.index}`);
+    info(`Gateway notified — broadcast index=${entry.index}`);
   } catch (err) {
-    console.warn(
-      `[RAFT][${config.REPLICA_ID}] Gateway notify failed (index=${entry.index}): ${err.message}`
-    );
+    warn(`Gateway notify failed (index=${entry.index}): ${err.message}`);
   }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 function start() {
-  console.log(`[RAFT][${config.REPLICA_ID}] ── Mini-RAFT node starting ──────────────────────`);
-  console.log(`[RAFT][${config.REPLICA_ID}]    Peers       : ${config.PEERS.join(', ') || '(none)'}`);
-  console.log(`[RAFT][${config.REPLICA_ID}]    Cluster size: ${CLUSTER_SIZE}`);
-  console.log(`[RAFT][${config.REPLICA_ID}]    Majority    : ${MAJORITY}`);
-  console.log(`[RAFT][${config.REPLICA_ID}]    Election TO : ${config.ELECTION_TIMEOUT_MIN_MS}–${config.ELECTION_TIMEOUT_MAX_MS} ms`);
-  console.log(`[RAFT][${config.REPLICA_ID}]    Heartbeat   : every ${config.HEARTBEAT_INTERVAL_MS} ms`);
-  console.log(`[RAFT][${config.REPLICA_ID}] ──────────────────────────────────────────────────`);
+  info(`── Mini-RAFT node starting ──────────────────────`);
+  info(`   Peers       : ${config.PEERS.join(', ') || '(none)'}`);
+  info(`   Cluster size: ${CLUSTER_SIZE}`);
+  info(`   Majority    : ${MAJORITY}`);
+  info(`   Election TO : ${config.ELECTION_TIMEOUT_MIN_MS}–${config.ELECTION_TIMEOUT_MAX_MS} ms`);
+  info(`   Heartbeat   : every ${config.HEARTBEAT_INTERVAL_MS} ms`);
+  info(`──────────────────────────────────────────────────`);
 
   // Add a small startup jitter based on the replica ID digit so all three nodes
   // don't fire their first election at exactly the same moment on Docker startup.
   // replica1 → +0 ms, replica2 → +50 ms, replica3 → +100 ms (well within timeout window)
   const idDigit   = parseInt(config.REPLICA_ID.replace(/\D/g, ''), 10) || 1;
   const jitter    = (idDigit - 1) * 50;
-  console.log(`[RAFT][${config.REPLICA_ID}] Applying startup jitter: ${jitter} ms`);
+  info(`Applying startup jitter: ${jitter} ms`);
   setTimeout(() => becomeFollower(0), jitter);
 }
 
