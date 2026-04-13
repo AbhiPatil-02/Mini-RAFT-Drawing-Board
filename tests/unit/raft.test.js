@@ -712,3 +712,86 @@ describe('handleClientStroke() — leader path (election required)', () => {
     expect(raft.getStatus().term).toBe(99);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scalability: 4-node cluster quorum correctness
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('scalability quorum (4-node cluster)', () => {
+  const FOUR_NODE_CONFIG = {
+    ...TEST_CONFIG,
+    PEERS: [
+      'http://replica2:4002',
+      'http://replica3:4003',
+      'http://replica4:4004',
+    ],
+  };
+
+  async function loadFourNodeLeader() {
+    jest.resetModules();
+
+    const axios4 = {
+      post: jest.fn().mockResolvedValue({ data: { term: 1, voteGranted: true, success: true } }),
+      get:  jest.fn().mockResolvedValue({ data: { state: 'Leader' } }),
+    };
+
+    jest.doMock('axios',                 () => axios4);
+    jest.doMock('../../replica1/config', () => FOUR_NODE_CONFIG);
+
+    const raft4 = require('../../replica1/raft');
+    const log4  = require('../../replica1/log');
+
+    raft4.start();
+    await jest.advanceTimersByTimeAsync(900);
+    expect(raft4.getStatus().state).toBe('Leader');
+
+    return { raft4, log4, axios4 };
+  }
+
+  test('commits when self + 2 peers ACK (majority 3 of 4)', async () => {
+    const { raft4, log4, axios4 } = await loadFourNodeLeader();
+
+    axios4.post.mockClear();
+    axios4.post.mockImplementation((url) => {
+      if (url.includes('/append-entries') && (url.includes('replica2') || url.includes('replica3'))) {
+        return Promise.resolve({ data: { success: true, term: 1 } });
+      }
+      if (url.includes('/append-entries') && url.includes('replica4')) {
+        return Promise.reject(new Error('ETIMEOUT'));
+      }
+      if (url.includes('/broadcast')) {
+        return Promise.resolve({ data: { success: true } });
+      }
+      return Promise.resolve({ data: { success: true, term: 1 } });
+    });
+
+    const result = await raft4.handleClientStroke(stroke('teal'));
+
+    expect(result.success).toBe(true);
+    expect(log4.getEntry(1).committed).toBe(true);
+    expect(raft4.getStatus().commitIndex).toBe(1);
+  });
+
+  test('does not commit when only self + 1 peer ACK (below majority 3 of 4)', async () => {
+    const { raft4, axios4 } = await loadFourNodeLeader();
+
+    axios4.post.mockClear();
+    axios4.post.mockImplementation((url) => {
+      if (url.includes('/append-entries') && url.includes('replica2')) {
+        return Promise.resolve({ data: { success: true, term: 1 } });
+      }
+      if (url.includes('/append-entries')) {
+        return Promise.reject(new Error('ETIMEOUT'));
+      }
+      if (url.includes('/broadcast')) {
+        return Promise.resolve({ data: { success: true } });
+      }
+      return Promise.resolve({ data: { success: true, term: 1 } });
+    });
+
+    const result = await raft4.handleClientStroke(stroke('orange'));
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('no quorum');
+  });
+});

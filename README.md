@@ -29,6 +29,22 @@ Open your browser at **http://localhost:8080** to access the drawing board.
 | Replica 1 | http://localhost:4001      | RAFT consensus node          |
 | Replica 2 | http://localhost:4002      | RAFT consensus node          |
 | Replica 3 | http://localhost:4003      | RAFT consensus node          |
+| Replica 4 | http://localhost:4004      | Optional RAFT node (scale override) |
+
+## Scalability
+
+### Add a 4th replica (without backend code changes)
+
+```bash
+# Start base stack + 4-node topology override
+docker compose -f docker-compose.yml -f docker-compose.scale4.yml up -d --build
+```
+
+The override file updates Gateway replica discovery and all peer lists so quorum stays correct for 4 nodes (majority = 3).
+
+### Add more clients
+
+No backend cluster changes are needed. Clients connect to the Gateway WebSocket endpoint, and the Gateway fan-outs committed strokes to all active connections.
 
 ## Common Commands
 
@@ -52,6 +68,8 @@ docker-compose restart replica1
 curl http://localhost:4001/status
 curl http://localhost:4002/status
 curl http://localhost:4003/status
+# Optional, when running docker-compose.scale4.yml
+curl http://localhost:4004/status
 
 # Tear down everything
 docker-compose down

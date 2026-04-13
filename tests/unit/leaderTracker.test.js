@@ -43,7 +43,7 @@ let tracker;
 let axiosMock;
 
 /** Helper — set up axios mock and (re)load the module */
-function loadTracker(axiosOverrides = {}) {
+function loadTracker(axiosOverrides = {}, replicasEnv = 'replica1:4001,replica2:4002,replica3:4003') {
   jest.resetModules();
 
   axiosMock = {
@@ -52,7 +52,7 @@ function loadTracker(axiosOverrides = {}) {
     ...axiosOverrides,
   };
 
-  process.env.REPLICAS = 'replica1:4001,replica2:4002,replica3:4003';
+  process.env.REPLICAS = replicasEnv;
 
   jest.doMock('axios', () => axiosMock);
 
@@ -95,6 +95,13 @@ describe('getStats()', () => {
     expect(replicas).toContain('http://replica1:4001');
     expect(replicas).toContain('http://replica2:4002');
     expect(replicas).toContain('http://replica3:4003');
+  });
+
+  test('supports a 4-replica list from env without code changes', () => {
+    loadTracker({}, 'replica1:4001,replica2:4002,replica3:4003,replica4:4004');
+    const { replicas } = tracker.getStats();
+    expect(replicas).toHaveLength(4);
+    expect(replicas).toContain('http://replica4:4004');
   });
 });
 
