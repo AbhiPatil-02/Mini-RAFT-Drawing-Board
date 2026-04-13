@@ -26,10 +26,10 @@ Open your browser at **http://localhost:8080** to access the drawing board.
 |-----------|----------------------------|------------------------------|
 | Frontend  | http://localhost:8080      | Browser drawing canvas       |
 | Gateway   | http://localhost:3000      | WebSocket server             |
-| Replica 1 | http://localhost:4001      | RAFT consensus node          |
-| Replica 2 | http://localhost:4002      | RAFT consensus node          |
-| Replica 3 | http://localhost:4003      | RAFT consensus node          |
-| Replica 4 | http://localhost:4004      | Optional RAFT node (scale override) |
+| Replica 1 | Internal only (`raft-net`) | RAFT consensus node          |
+| Replica 2 | Internal only (`raft-net`) | RAFT consensus node          |
+| Replica 3 | Internal only (`raft-net`) | RAFT consensus node          |
+| Replica 4 | Internal only (`raft-net`) | Optional RAFT node (scale override) |
 
 ## Scalability
 
@@ -64,12 +64,8 @@ docker-compose restart replica1
 # Trigger hot-reload by editing source
 # (edit any file in replica1/ — container restarts automatically)
 
-# Check RAFT status of all replicas
-curl http://localhost:4001/status
-curl http://localhost:4002/status
-curl http://localhost:4003/status
-# Optional, when running docker-compose.scale4.yml
-curl http://localhost:4004/status
+# Check Gateway health (includes current leader)
+curl http://localhost:3000/health
 
 # Tear down everything
 docker-compose down

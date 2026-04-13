@@ -22,8 +22,8 @@ services:
 
   replica4:
     build: ./replica1
-    ports:
-      - "4004:4004"
+    expose:
+      - "4004"
     environment:
       - REPLICA_ID=replica4
       - PORT=4004
