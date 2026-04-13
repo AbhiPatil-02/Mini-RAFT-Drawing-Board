@@ -55,12 +55,16 @@ jobs:
             "
           done
 
-      # ── 1b. Validate docker-compose.yml ─────────────────────────────────
-      - name: Validate docker-compose.yml
+      # ── 1b. Validate Docker Compose topologies ───────────────────────────
+      - name: Validate Docker Compose files
         run: |
           echo "▶ Validating docker-compose.yml…"
           docker compose -f docker-compose.yml config --quiet
           echo "  ✓ docker-compose.yml is valid"
+
+          echo "▶ Validating merged scale4 topology…"
+          docker compose -f docker-compose.yml -f docker-compose.scale4.yml config --quiet
+          echo "  ✓ docker-compose.yml + docker-compose.scale4.yml is valid"
 
       # ── 1c. Ensure node_modules are not committed ────────────────────────
       - name: Check node_modules not committed

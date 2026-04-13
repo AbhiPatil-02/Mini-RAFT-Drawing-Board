@@ -34,11 +34,41 @@ const log    = require('./log');
 // ── Structured logger ─────────────────────────────────────────────────────────
 // All log lines carry an ISO timestamp + replica ID + severity tag so that
 // docker logs across replicas can be correlated and grepped by level.
-const _ts   = () => new Date().toISOString();
-const rlog  = (level, msg) => console.log(`${_ts()} [${level}][RAFT][${config.REPLICA_ID}] ${msg}`);
-const info  = (msg) => rlog('INFO ', msg);
-const warn  = (msg) => rlog('WARN ', msg);
-const error = (msg) => rlog('ERROR', msg);
+const _ts = () => new Date().toISOString();
+
+const LEVELS = {
+  DEBUG: 10,
+  INFO:  20,
+  WARN:  30,
+  ERROR: 40,
+};
+
+const ACTIVE_LOG_LEVEL = LEVELS[config.LOG_LEVEL] ? config.LOG_LEVEL : 'INFO';
+
+function _log(level, msg) {
+  if (LEVELS[level] < LEVELS[ACTIVE_LOG_LEVEL]) return;
+  console.log(`${_ts()} [${level.padEnd(5)}][RAFT][${config.REPLICA_ID}] ${msg}`);
+}
+
+const debug = (msg) => _log('DEBUG', msg);
+const info  = (msg) => _log('INFO', msg);
+const warn  = (msg) => _log('WARN', msg);
+const error = (msg) => _log('ERROR', msg);
+
+function summarizeStroke(stroke) {
+  const points = Array.isArray(stroke?.points) ? stroke.points.length : 0;
+  const color  = stroke?.color ?? 'n/a';
+  const width  = stroke?.width ?? 'n/a';
+  return `stroke(points=${points}, color=${color}, width=${width})`;
+}
+
+function logCommitEvent(entry, source) {
+  if (!entry) return;
+  info(
+    `COMMIT index=${entry.index}, term=${entry.term}, ${summarizeStroke(entry.stroke)}` +
+    `, source=${source}`
+  );
+}
 
 // ── State variables ───────────────────────────────────────────────────────────
 let state         = 'Follower';  // 'Follower' | 'Candidate' | 'Leader'
@@ -145,15 +175,22 @@ async function startElection() {
   let votes       = 1; // Self-vote already recorded in becomeCandidate()
   let steppedDown = false;
 
+  const reqLastLogIndex = log.lastIndex();
+  const reqLastLogTerm  = log.lastTerm();
+
   info(`Requesting votes from ${config.PEERS.length} peer(s)...`);
 
   const voteRequests = config.PEERS.map(async (peer) => {
+    debug(
+      `RequestVote → ${peer} (term=${currentTerm}, lastLogIndex=${reqLastLogIndex},` +
+      ` lastLogTerm=${reqLastLogTerm})`
+    );
     try {
       const res = await axios.post(`${peer}/request-vote`, {
         term:         currentTerm,
         candidateId:  config.REPLICA_ID,
-        lastLogIndex: log.lastIndex(),
-        lastLogTerm:  log.lastTerm(),
+        lastLogIndex: reqLastLogIndex,
+        lastLogTerm:  reqLastLogTerm,
       }, { timeout: config.RPC_TIMEOUT_MS });
 
       if (res.data.term > currentTerm) {
@@ -205,16 +242,26 @@ async function startElection() {
 async function sendHeartbeats() {
   if (state !== 'Leader') return;
 
+  debug(
+    `Heartbeat tick (term=${currentTerm}, leaderCommit=${commitIndex}, peers=${config.PEERS.length})`
+  );
+
   const laggingPeers = [];
 
   await Promise.allSettled(
     config.PEERS.map(async (peer) => {
+      debug(`Heartbeat → ${peer} (term=${currentTerm}, leaderCommit=${commitIndex})`);
       try {
         const res = await axios.post(`${peer}/heartbeat`, {
           term:         currentTerm,
           leaderId:     config.REPLICA_ID,
           leaderCommit: commitIndex,
         }, { timeout: config.RPC_TIMEOUT_MS });
+
+        debug(
+          `Heartbeat ACK ← ${peer}` +
+          ` (term=${res.data.term}, success=${res.data.success}, logLength=${res.data.logLength ?? 'n/a'})`
+        );
 
         if (res.data.term > currentTerm) {
           info(`Higher term (${res.data.term}) in heartbeat reply from ${peer} — stepping down`);
@@ -237,6 +284,7 @@ async function sendHeartbeats() {
       } catch {
         // Peer unreachable — it will eventually time out and start an election itself
         // Intentionally silent: don't spam logs on every missed heartbeat pulse
+        debug(`Heartbeat timeout/unreachable ← ${peer}`);
       }
     })
   );
@@ -301,8 +349,14 @@ function handleRequestVote(body) {
 function handleHeartbeat(body) {
   const { term, leaderId, leaderCommit } = body;
 
+  debug(
+    `Heartbeat received ← ${leaderId}` +
+    ` (term=${term}, leaderCommit=${leaderCommit}, currentTerm=${currentTerm})`
+  );
+
   // Reject stale leader
   if (term < currentTerm) {
+    debug(`Heartbeat rejected as stale (incomingTerm=${term}, currentTerm=${currentTerm})`);
     return { term: currentTerm, success: false };
   }
 
@@ -321,6 +375,7 @@ function handleHeartbeat(body) {
     const newCommit = Math.min(leaderCommit, log.lastIndex());
     for (let i = commitIndex + 1; i <= newCommit; i++) {
       log.commit(i);
+      logCommitEvent(log.getEntry(i), `heartbeat:${leaderId}`);
     }
     commitIndex = newCommit;
     info(`commitIndex → ${commitIndex} (via heartbeat from ${leaderId})`);
@@ -403,6 +458,7 @@ function handleAppendEntries(body) {
     const newCommit = Math.min(leaderCommit, log.lastIndex());
     for (let i = commitIndex + 1; i <= newCommit; i++) {
       log.commit(i);
+      logCommitEvent(log.getEntry(i), `append-entries:${leaderId}`);
     }
     commitIndex = newCommit;
     info(`commitIndex → ${commitIndex} (via AppendEntries from ${leaderId})`);
@@ -450,6 +506,7 @@ function handleSyncLog(body) {
     const newCommit = Math.min(leaderCommit, log.lastIndex());
     for (let i = commitIndex + 1; i <= newCommit; i++) {
       log.commit(i);
+      logCommitEvent(log.getEntry(i), `sync-log:${leaderId}`);
     }
     commitIndex = newCommit;
     info(`Post-sync commitIndex → ${commitIndex}`);
@@ -541,6 +598,7 @@ async function handleClientStroke(stroke) {
   if (acks >= MAJORITY) {
     commitIndex = entry.index;
     log.commit(entry.index);
+    logCommitEvent(entry, 'leader-local-quorum');
     info(`✓ Committed index=${entry.index} (acks: ${acks}/${CLUSTER_SIZE})`);
 
     // Step 4: Notify Gateway → broadcasts committed stroke to all WS clients

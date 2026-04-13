@@ -1,0 +1,33 @@
+services:
+  gateway:
+    environment:
+      - REPLICAS=replica1:4001,replica2:4002,replica3:4003,replica4:4004
+    depends_on:
+      - replica1
+      - replica2
+      - replica3
+      - replica4
+
+  replica1:
+    environment:
+      - PEERS=replica2:4002,replica3:4003,replica4:4004
+
+  replica2:
+    environment:
+      - PEERS=replica1:4001,replica3:4003,replica4:4004
+
+  replica3:
+    environment:
+      - PEERS=replica1:4001,replica2:4002,replica4:4004
+
+  replica4:
+    build: ./replica1
+    expose:
+      - "4004"
+    environment:
+      - REPLICA_ID=replica4
+      - PORT=4004
+      - PEERS=replica1:4001,replica2:4002,replica3:4003
+      - GATEWAY_URL=http://gateway:3000
+    networks:
+      - raft-net

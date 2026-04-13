@@ -49,7 +49,13 @@ const lerror = (msg) => console.error(`${_ts()} [ERROR][LeaderTracker] ${msg}`);
 
 // ── Replica address list ──────────────────────────────────────────────────────
 // Parsed from REPLICAS env var: "replica1:4001,replica2:4002,replica3:4003"
-const REPLICAS = (process.env.REPLICAS || 'replica1:4001,replica2:4002,replica3:4003')
+// REPLICA_ENDPOINTS is accepted as a fallback for easier topology scaling.
+const replicaListCsv =
+  process.env.REPLICAS ||
+  process.env.REPLICA_ENDPOINTS ||
+  'replica1:4001,replica2:4002,replica3:4003';
+
+const REPLICAS = replicaListCsv
   .split(',')
   .map(r => `http://${r.trim()}`);
 
