@@ -46,7 +46,8 @@ let isDrawing         = false;
 let currentColor      = '#1e1e2e';
 let brushSize         = 4;
 let isEraser          = false;
-let currentStrokePoints = [];   // Raw points collected during current stroke gesture
+let currentStrokePoints = [];   // Deprecated: replaced by emittedAnySegment
+let emittedAnySegment = false;  // Track if any segment was sent during gesture
 let lastEmittedPoint  = null;   // Last recorded point — used for decimation
 
 // ── Point decimation threshold ────────────────────────────────────────────────
@@ -168,11 +169,10 @@ function onPointerDown(e) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   e.preventDefault();
   isDrawing = true;
-  currentStrokePoints = [];
+  emittedAnySegment   = false;
   lastEmittedPoint    = null;
 
   const pt = eventToPoint(e);
-  currentStrokePoints.push(pt);
   lastEmittedPoint = pt;
 
   // Begin live path on canvas immediately for responsive feel
@@ -195,7 +195,19 @@ function onPointerMove(e) {
   const threshold2 = MIN_POINT_DISTANCE_PX * MIN_POINT_DISTANCE_PX;
   if (lastEmittedPoint && dist2(pt, lastEmittedPoint) < threshold2) return;
 
-  currentStrokePoints.push(pt);
+  const strokeData = {
+    points: [lastEmittedPoint, pt],
+    color:  isEraser ? 'eraser' : currentColor,
+    width:  brushSize,
+  };
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    const tempId  = nextTempId++;
+    pendingStrokes.push({ tempId, ...strokeData });
+    sendStroke(strokeData);
+    emittedAnySegment = true;
+  }
+
   lastEmittedPoint = pt;
 
   ctx.lineTo(pt.x, pt.y);
@@ -210,33 +222,28 @@ function onPointerUp(e) {
   ctx.restore();
   isDrawing = false;
 
-  // Ensure at least 2 points for a visible stroke
-  if (currentStrokePoints.length < 2) {
-    const pt = currentStrokePoints[0];
-    if (pt) currentStrokePoints.push({ x: pt.x + 0.5, y: pt.y + 0.5 });
-  }
-  if (currentStrokePoints.length < 2) return;
+  // Handle single click or very small movements that didn't trigger decimation threshold
+  if (!emittedAnySegment && lastEmittedPoint) {
+    const strokeData = {
+      points: [lastEmittedPoint, { x: lastEmittedPoint.x + 0.5, y: lastEmittedPoint.y + 0.5 }],
+      color:  isEraser ? 'eraser' : currentColor,
+      width:  brushSize,
+    };
 
-  const strokeData = {
-    points: currentStrokePoints,
-    color:  isEraser ? 'eraser' : currentColor,
-    width:  brushSize,
-  };
-
-  // [BUG-8 FIX] Only add to pendingStrokes if the WS is actually open.
-  // If the socket is connecting/closed, sendStroke will be a no-op anyway,
-  // but without this guard the stroke would accumulate as a ghost pending
-  // entry that never gets resolved (no commit ACK arrives for undelivered strokes).
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    const tempId  = nextTempId++;
-    pendingStrokes.push({ tempId, ...strokeData });
-    sendStroke(strokeData);
-  } else {
-    console.debug('[WS] Stroke drawn while socket not open — discarding (not added to pending)');
+    // [BUG-8 FIX] Only add to pendingStrokes if the WS is actually open.
+    // If the socket is connecting/closed, sendStroke will be a no-op anyway,
+    // but without this guard the stroke would accumulate as a ghost pending
+    // entry that never gets resolved (no commit ACK arrives for undelivered strokes).
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const tempId  = nextTempId++;
+      pendingStrokes.push({ tempId, ...strokeData });
+      sendStroke(strokeData);
+    } else {
+      console.debug('[WS] Stroke drawn while socket not open — discarding (not added to pending)');
+    }
   }
 
-  currentStrokePoints = [];
-  lastEmittedPoint    = null;
+  lastEmittedPoint = null;
 }
 
 // Mouse events
