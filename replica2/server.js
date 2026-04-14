@@ -1,23 +1,25 @@
 /**
- * server.js — Replica HTTP Server
+ * server.js — Replica HTTP Server  (Multi-Tenant Edition)
  *
  * Exposes all RAFT RPC endpoints and starts the RAFT state machine.
  *
+ * Multi-tenant change: boardId is threaded through client-stroke, committed-log,
+ * append-entries, and sync-log so each board's log is managed independently.
+ *
  * Endpoints:
  *  POST /request-vote    — Candidate requests vote from peer
- *  POST /append-entries  — Leader replicates a log entry to follower
- *  POST /heartbeat       — Leader heartbeat to suppress follower elections
- *  POST /sync-log        — Leader sends missing entries to lagging follower
- *  POST /client-stroke   — Gateway forwards a client stroke (Leader only)
- *  GET  /status          — Current RAFT state: { id, state, term, leader, logLength, commitIndex }
- *  GET  /committed-log   — All committed strokes (used by Gateway for full-sync on client connect)
+ *  POST /append-entries  — Leader replicates a log entry to follower (boardId in body)
+ *  POST /heartbeat       — Leader heartbeat; carries per-board commitIndex map
+ *  POST /sync-log        — Leader sends missing entries to lagging follower (boardId in body)
+ *  POST /client-stroke   — Gateway forwards a client stroke (boardId in body, Leader only)
+ *  GET  /status          — Current RAFT state: { id, state, term, leader, logLength, commitIndex, boards }
+ *  GET  /committed-log   — Committed strokes for a board (?boardId=X, default: board-public)
  *
  * [OBS-4] Unknown routes return a JSON 404 (not Express's default HTML).
  */
 
 const express = require('express');
 const raft    = require('./raft');
-const log     = require('./log');
 const config  = require('./config');
 
 const app = express();
@@ -30,6 +32,7 @@ app.post('/request-vote', (req, res) => {
   res.json(result);
 });
 
+// boardId is included in body — raft.js routes to correct board log
 app.post('/append-entries', (req, res) => {
   const result = raft.handleAppendEntries(req.body);
   res.json(result);
@@ -40,6 +43,7 @@ app.post('/heartbeat', (req, res) => {
   res.json(result);
 });
 
+// boardId is included in body
 app.post('/sync-log', (req, res) => {
   const result = raft.handleSyncLog(req.body);
   res.json(result);
@@ -47,8 +51,14 @@ app.post('/sync-log', (req, res) => {
 
 // ── Client Stroke (from Gateway) ──────────────────────────────────────────────
 
+/**
+ * POST /client-stroke
+ * Body: { boardId, stroke: { points, color, width } }
+ * boardId defaults to 'board-public' if omitted (free-draw mode).
+ */
 app.post('/client-stroke', async (req, res) => {
-  const result = await raft.handleClientStroke(req.body.stroke);
+  const { stroke, boardId } = req.body;
+  const result = await raft.handleClientStroke(stroke, boardId);
   res.json(result);
 });
 
@@ -56,8 +66,8 @@ app.post('/client-stroke', async (req, res) => {
 
 /**
  * GET /status
- * Returns the current observable RAFT state.
- * Shape (SRS §6.1): { id, state, term, leader, logLength, commitIndex }
+ * Returns: { id, state, term, leader, logLength, commitIndex, boards }
+ * 'boards' maps boardId → { logLength, commitIndex } for observability.
  */
 app.get('/status', (req, res) => {
   res.json(raft.getStatus());
@@ -66,24 +76,19 @@ app.get('/status', (req, res) => {
 // ── Committed Log (for Gateway full-sync) ─────────────────────────────────────
 
 /**
- * GET /committed-log
- * Returns all committed stroke entries so the Gateway can push them
- * to a newly connected client via the "full-sync" WebSocket message.
- *
+ * GET /committed-log?boardId=X
+ * Returns all committed stroke entries for the given board.
+ * boardId defaults to 'board-public' if omitted.
  * Response: { strokes: [ { index, points, color, width, ... } ] }
  */
 app.get('/committed-log', (req, res) => {
-  const committed = log.getCommitted();
-  const strokes   = committed.map(e => ({ index: e.index, ...e.stroke }));
+  const boardId = req.query.boardId || 'board-public';
+  const strokes = raft.getCommittedLog(boardId);
   res.json({ strokes });
 });
 
 // ── 404 catch-all ────────────────────────────────────────────────────────────
 
-/**
- * [OBS-4] Return structured JSON for any unmatched route so callers get a
- * machine-readable error instead of Express's default HTML 404 page.
- */
 // eslint-disable-next-line no-unused-vars
 app.use((req, res) => {
   const ts = new Date().toISOString();
