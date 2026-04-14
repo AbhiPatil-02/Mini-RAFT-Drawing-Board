@@ -4,7 +4,7 @@
 # Stages:
 #   1. lint-and-validate  — structural checks (docker-compose, package.json)
 #   2. unit-tests         — Jest unit suite with coverage upload
-#   3. docker-build       — parallel matrix build of all 6 service images
+#   3. docker-build       — parallel matrix build of all 5 service images
 # ────────────────────────────────────────────────────────────────────────────
 
 name: CI
@@ -74,7 +74,6 @@ jobs:
           echo "  ✓ No node_modules committed"
 
       # ── 1d. Verify all Dockerfiles exist ────────────────────────────────
-      # Note: replica4 reuses ./replica1/Dockerfile (same image, different env)
       - name: Check Dockerfiles exist
         run: |
           echo "▶ Checking Dockerfiles…"
@@ -85,7 +84,6 @@ jobs:
             fi
             echo "  ✓ $svc/Dockerfile"
           done
-          echo "  ✓ replica4 (reuses replica1/Dockerfile)"
 
   # ──────────────────────────────────────────────────────────────────────────
   # JOB 2 — Unit Tests
@@ -146,8 +144,7 @@ jobs:
           retention-days: 14
 
   # ──────────────────────────────────────────────────────────────────────────
-  # JOB 3 — Docker Build (parallel matrix across all 6 services)
-  # replica4 reuses ./replica1 build context (same image, different env vars)
+  # JOB 3 — Docker Build (parallel matrix across all 5 services)
   # ──────────────────────────────────────────────────────────────────────────
   docker-build:
     name: 🐳 Docker Build (${{ matrix.service }})
@@ -165,8 +162,6 @@ jobs:
             context: ./replica2
           - service: replica3
             context: ./replica3
-          - service: replica4
-            context: ./replica1   # shares the same Dockerfile as replica1
           - service: gateway
             context: ./gateway
           - service: frontend
