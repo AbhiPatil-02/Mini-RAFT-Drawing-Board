@@ -762,4 +762,6 @@ module.exports = {
   handleSyncLog,
   handleClientStroke,
   getCommittedLog,
+  // ── Test helper: access the default board's StrokeLog (for unit tests only) ──
+  _getDefaultLog: () => _getLog(DEFAULT_BOARD),
 };
