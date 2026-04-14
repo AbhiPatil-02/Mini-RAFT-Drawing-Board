@@ -65,11 +65,12 @@ beforeEach(() => {
   jest.doMock('axios',                    () => axiosMock);
   jest.doMock('../../replica1/config',    () => TEST_CONFIG);
 
-  // Load raft.js — internally loads a fresh log.js singleton
+  // Load raft.js — internally manages per-board StrokeLog instances
   raft = require('../../replica1/raft');
 
-  // Grab the same log instance raft.js is using (cached from the require above)
-  log = require('../../replica1/log');
+  // Grab the default board's StrokeLog instance that raft.js is using
+  // (log.js now exports the class, not a singleton, so we use raft's helper)
+  log = raft._getDefaultLog();
 });
 
 afterEach(() => {
@@ -235,7 +236,7 @@ describe('handleHeartbeat()', () => {
     log.append(1, stroke('a'));
     log.append(1, stroke('b'));
 
-    raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 2 });
+    raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 2, boardCommits: { 'board-public': 2 } });
 
     expect(raft.getStatus().commitIndex).toBe(2);
     expect(log.getEntry(1).committed).toBe(true);
@@ -245,7 +246,7 @@ describe('handleHeartbeat()', () => {
   test('does not advance commitIndex beyond our log length', () => {
     log.append(1, stroke()); // only 1 entry, leader says commit up to 5
 
-    raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 5 });
+    raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 5, boardCommits: { 'board-public': 5 } });
 
     // Min(5, logLength=1) = 1
     expect(raft.getStatus().commitIndex).toBe(1);
@@ -253,10 +254,10 @@ describe('handleHeartbeat()', () => {
 
   test('does not regress commitIndex when leaderCommit < ours', () => {
     log.append(1, stroke());
-    raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 1 });
+    raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 1, boardCommits: { 'board-public': 1 } });
     const ci1 = raft.getStatus().commitIndex;
 
-    // Another heartbeat with leaderCommit = 0 (stale)
+    // Another heartbeat with leaderCommit = 0 (stale) — no boardCommits so no regression
     raft.handleHeartbeat({ term: 1, leaderId: 'replica2', leaderCommit: 0 });
     expect(raft.getStatus().commitIndex).toBe(ci1);
   });
@@ -739,7 +740,8 @@ describe('scalability quorum (4-node cluster)', () => {
     jest.doMock('../../replica1/config', () => FOUR_NODE_CONFIG);
 
     const raft4 = require('../../replica1/raft');
-    const log4  = require('../../replica1/log');
+    // Get the default board log from this fresh raft instance
+    const log4  = raft4._getDefaultLog();
 
     raft4.start();
     await jest.advanceTimersByTimeAsync(900);

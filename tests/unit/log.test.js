@@ -15,12 +15,13 @@
  *  ✓ length          — getter matches entries.length
  */
 
-// A fresh StrokeLog singleton is loaded before each test via resetModules().
+// A fresh StrokeLog instance is created before each test via resetModules().
 let log;
 
 beforeEach(() => {
   jest.resetModules();
-  log = require('../../replica1/log');
+  const StrokeLog = require('../../replica1/log');
+  log = new StrokeLog();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -197,7 +197,7 @@ async function _verifyHint(hintUrl) {
 
 // ── Stroke Queue Helpers ──────────────────────────────────────────────────────
 
-function _enqueue(stroke) {
+function _enqueue(stroke, boardId) {
   if (strokeQueue.length >= MAX_QUEUE_SIZE) {
     // Drop the oldest entry to prevent unbounded memory growth
     const dropped = strokeQueue.shift();
@@ -206,7 +206,7 @@ function _enqueue(stroke) {
       ` (points=${dropped?.points?.length ?? '?'})`
     );
   }
-  strokeQueue.push({ stroke, retries: 0 });
+  strokeQueue.push({ stroke, boardId: boardId || 'board-public', retries: 0 });
 }
 
 /**
@@ -230,7 +230,7 @@ async function replayQueue() {
       strokeQueue.shift();
       lwarn(
         `Stroke exhausted ${MAX_REPLAY_RETRIES} retries — discarding` +
-        ` (points=${item.stroke?.points?.length ?? '?'})`
+        ` (board=${item.boardId}, points=${item.stroke?.points?.length ?? '?'})`
       );
       continue;
     }
@@ -240,7 +240,7 @@ async function replayQueue() {
     try {
       const res = await axios.post(
         `${currentLeader}/client-stroke`,
-        { stroke: item.stroke },
+        { stroke: item.stroke, boardId: item.boardId },
         { timeout: FORWARD_TIMEOUT_MS }
       );
 
@@ -258,9 +258,9 @@ async function replayQueue() {
       }
 
       strokeQueue.shift(); // Successfully delivered → remove from queue
-      linfo(`Replayed queued stroke (index=${res.data.index})`);
+      linfo(`Replayed queued stroke (board=${item.boardId}, index=${res.data.index})`);
     } catch (err) {
-      lwarn(`Replay failed (attempt ${item.retries}): ${err.message}`);
+      lwarn(`Replay failed (attempt ${item.retries}, board=${item.boardId}): ${err.message}`);
       _setLeader(null);
       await discoverLeader(); // Attempt to find a new leader
       if (!currentLeader) break; // Still no leader — stop replaying
@@ -321,9 +321,9 @@ async function _resolveLeaderFromHint(hintLeaderId) {
  *
  * @param {object} strokeToQueue - stroke that triggered the failure (enqueued first)
  */
-async function _runFailoverRecovery(strokeToQueue) {
+async function _runFailoverRecovery(strokeToQueue, boardId) {
   // Always queue the failing stroke first
-  _enqueue(strokeToQueue);
+  _enqueue(strokeToQueue, boardId);
 
   // Signal failover has started (only on first entry)
   _setFailoverActive(true);
@@ -396,13 +396,18 @@ function isFailoverInProgress() {
  *  double-replay race.  Now Case 1 routes through _runFailoverRecovery() which
  *  uses the same serialised await path as Case 3.
  */
-async function forwardStroke(stroke) {
+/**
+ * Forward a stroke (with its boardId) to the current leader.
+ * boardId defaults to 'board-public' if not provided.
+ */
+async function forwardStroke(stroke, boardId) {
+  const bid = boardId || 'board-public';
+
   // ── Case 1: No leader currently known (or failover already running) ─────────
   if (!currentLeader) {
-    lwarn('No leader — queuing stroke via serialised failover recovery');
-    // [BUG-3 FIX] Use the properly-awaited _runFailoverRecovery path instead of a
-    // fire-and-forget discoverLeader to prevent the double-discovery race condition.
-    _runFailoverRecovery(stroke).catch((err) => {
+    lwarn(`No leader — queuing stroke (board=${bid}) via serialised failover recovery`);
+    // [BUG-3 FIX] Use the properly-awaited _runFailoverRecovery path
+    _runFailoverRecovery(stroke, bid).catch((err) => {
       lerror(`Failover recovery threw unexpectedly: ${err.message}`);
     });
     return { queued: true };
@@ -412,14 +417,14 @@ async function forwardStroke(stroke) {
   try {
     const res = await axios.post(
       `${currentLeader}/client-stroke`,
-      { stroke },
+      { stroke, boardId: bid },
       { timeout: FORWARD_TIMEOUT_MS }
     );
 
     if (!res.data.success) {
       // Leader responded but it's no longer the leader (e.g. stepped down mid-term)
-      lwarn(`Leader rejected stroke: "${res.data.error}" — resolving via hint`);
-      await _runFailoverRecovery(stroke);
+      lwarn(`Leader rejected stroke (board=${bid}): "${res.data.error}" — resolving via hint`);
+      await _runFailoverRecovery(stroke, bid);
       return { queued: true };
     }
 
@@ -427,8 +432,8 @@ async function forwardStroke(stroke) {
 
   } catch (err) {
     // ── Case 3: Leader unreachable (timeout / network error) ─────────────
-    lerror(`Leader unreachable (${err.message}) — entering serialised failover`);
-    await _runFailoverRecovery(stroke);
+    lerror(`Leader unreachable (${err.message}) — entering serialised failover (board=${bid})`);
+    await _runFailoverRecovery(stroke, bid);
     return { queued: true };
   }
 }

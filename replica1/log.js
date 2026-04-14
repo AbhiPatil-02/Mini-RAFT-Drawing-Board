@@ -11,6 +11,9 @@
  *  - Committed entries are NEVER overwritten (truncateFrom guards this)
  *  - Log index is 1-based
  *
+ * Multi-tenant change: exports the StrokeLog CLASS (not a singleton instance)
+ * so raft.js can maintain one StrokeLog per boardId in a Map.
+ *
  * [BUG-7 FIX] truncateFrom now emits a warning when called beyond log length.
  */
 
@@ -105,5 +108,5 @@ class StrokeLog {
   }
 }
 
-module.exports = new StrokeLog();
-
+// Export the class — raft.js instantiates one StrokeLog per boardId
+module.exports = StrokeLog;

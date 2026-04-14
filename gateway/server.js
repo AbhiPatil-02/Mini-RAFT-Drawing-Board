@@ -1,38 +1,35 @@
 /**
- * server.js — Gateway Service
+ * server.js — Gateway Service  (Multi-Tenant Edition)
  *
  * Responsibilities:
  *  ✓ Accept WebSocket connections from browser clients
- *  ✓ Maintain Set of active WebSocket connections
- *  ✓ On new connection: send full-sync of all committed strokes from leader
- *    (retries once against the new leader if the first attempt fails during failover)
- *  ✓ On WS message { type:"stroke" }: forward to current leader via leaderTracker
- *  ✓ On WS message { type:"ping" }: pong back (connection keep-alive)
- *  ✓ On WS close/error: remove from clients set
- *  ✓ POST /broadcast: receive committed stroke from leader → broadcast to all clients
- *  ✓ GET  /health: return gateway liveness + current leader + failoverActive flag
- *  ✓ GET  /status: alias for /health (used by monitoring)
+ *  ✓ boardClients: Map<boardId, Set<ws>> — board-scoped WS channels
+ *  ✓ On 'join-board' message: register client in board room, send full-sync for that board
+ *  ✓ On 'stroke' message: forward to Leader with boardId via leaderTracker
+ *  ✓ On 'ping': pong back
+ *  ✓ On WS close/error: remove from all board rooms
+ *  ✓ POST /broadcast: { boardId, stroke } → push only to boardClients[boardId]
+ *  ✓ GET  /health: liveness + leader + boardCount + totalClients + failoverActive
  *
- *  ✓ GRACEFUL FAILOVER — no client disconnects during leader transitions:
- *      - leaderTracker queues strokes and replays them serially once a new leader is found
- *      - failover start/end broadcasts 'leader-changing' / 'leader-restored' WS messages
- *        so the frontend can show a status indicator without closing the connection
- *      - sendFullSync retries against a newly discovered leader if the first attempt
- *        fails (handles the case where a client connects exactly during failover)
+ *  ✓ GRACEFUL FAILOVER — preserved from Week 2:
+ *      - leaderTracker queues strokes and replays once a new leader is found
+ *      - 'leader-changing' / 'leader-restored' broadcast to ALL clients (global event)
  *
- * WebSocket Message Shapes (SRS §6.3):
+ * WebSocket Message Shapes:
  *
  *  Client → Gateway:
- *    { type: "stroke", data: { points, color, width } }
+ *    { type: "join-board", boardId }                           ← NEW
+ *    { type: "stroke", boardId, data: { points, color, width } }
  *    { type: "ping" }
  *
  *  Gateway → Client:
- *    { type: "stroke-committed",  data: { index, points, color, width, userId? } }
- *    { type: "full-sync",         data: { strokes: [ { index, points, color, width } ] } }
- *    { type: "leader-changing",   data: { message } }   ← NEW: failover started
- *    { type: "leader-restored",   data: { leader } }    ← NEW: failover ended
+ *    { type: "full-sync",        boardId, data: { strokes: [] } }    ← NEW: scoped
+ *    { type: "stroke-committed", boardId, data: { index, ... } }     ← NEW: scoped
+ *    { type: "user-count",       boardId, count }                    ← NEW
+ *    { type: "leader-changing",  data: { message } }
+ *    { type: "leader-restored",  data: { leader } }
  *    { type: "pong" }
- *    { type: "error",             data: { message } }
+ *    { type: "error",            data: { message } }
  */
 
 const express       = require('express');
@@ -55,13 +52,55 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ── Client registry ───────────────────────────────────────────────────────────
+// ── Board-scoped client registry ──────────────────────────────────────────────
 /**
- * All active WebSocket connections. We use a Set so add/delete are O(1).
- * Each ws object is augmented with an `id` for logging.
+ * boardClients: Map<boardId, Set<ws>>
+ *
+ * Each ws is also augmented with:
+ *   ws.id      — monotonic counter for logging
+ *   ws.boardId — the board this client has joined (null until join-board received)
  */
-const clients = new Set();
+const boardClients  = new Map();   // boardId → Set<ws>
 let clientIdCounter = 0;
+
+const DEFAULT_BOARD = 'board-public';
+
+/** Ensure the board room exists and return its Set<ws>. */
+function _getRoom(boardId) {
+  if (!boardClients.has(boardId)) {
+    boardClients.set(boardId, new Set());
+  }
+  return boardClients.get(boardId);
+}
+
+/** Add a client to a board room; remove from previous room if switching. */
+function _joinRoom(ws, boardId) {
+  // Remove from old room
+  if (ws.boardId && ws.boardId !== boardId) {
+    const oldRoom = boardClients.get(ws.boardId);
+    if (oldRoom) {
+      oldRoom.delete(ws);
+      _broadcastUserCount(ws.boardId);
+    }
+  }
+  ws.boardId = boardId;
+  _getRoom(boardId).add(ws);
+  _broadcastUserCount(boardId);
+}
+
+/** Remove a client from its board room. */
+function _leaveRoom(ws) {
+  if (!ws.boardId) return;
+  const room = boardClients.get(ws.boardId);
+  if (room) {
+    room.delete(ws);
+    _broadcastUserCount(ws.boardId);
+    if (room.size === 0) {
+      // Optionally keep the room alive for re-joins: do NOT delete map entry
+      // so the log is preserved. If we wanted to GC empty rooms we'd delete here.
+    }
+  }
+}
 
 /** Send a JSON message to a single WebSocket client (safe — checks OPEN state). */
 function sendToClient(ws, payload) {
@@ -70,11 +109,13 @@ function sendToClient(ws, payload) {
   }
 }
 
-/** Broadcast a JSON message to every connected client. */
-function broadcast(payload) {
+/** Broadcast a JSON message to all clients in a specific board room. */
+function broadcastToBoard(boardId, payload) {
+  const room = boardClients.get(boardId);
+  if (!room) return 0;
   const msg = JSON.stringify(payload);
   let sent = 0;
-  for (const ws of clients) {
+  for (const ws of room) {
     if (ws.readyState === OPEN) {
       ws.send(msg);
       sent++;
@@ -83,82 +124,106 @@ function broadcast(payload) {
   return sent;
 }
 
+/** Broadcast a JSON message to ALL connected clients (global events: failover). */
+function broadcastAll(payload) {
+  const msg = JSON.stringify(payload);
+  let sent = 0;
+  for (const room of boardClients.values()) {
+    for (const ws of room) {
+      if (ws.readyState === OPEN) {
+        ws.send(msg);
+        sent++;
+      }
+    }
+  }
+  // Also send to unjoined clients (those still in the lobby / not in any room)
+  for (const ws of unjoinedClients) {
+    if (ws.readyState === OPEN) {
+      ws.send(msg);
+      sent++;
+    }
+  }
+  return sent;
+}
+
+/**
+ * unjoinedClients: Set<ws>
+ * Clients that have connected but not yet sent join-board.
+ * They receive failover broadcasts but no board-specific messages.
+ */
+const unjoinedClients = new Set();
+
+/** Push user-count update to all clients in a board room. */
+function _broadcastUserCount(boardId) {
+  const room  = boardClients.get(boardId);
+  const count = room ? room.size : 0;
+  broadcastToBoard(boardId, { type: 'user-count', boardId, count });
+}
+
 // ── Full-sync helper ──────────────────────────────────────────────────────────
 const axios = require('axios');
 
-/**
- * Full-sync retry wait (ms).  If the leader just died, we wait briefly and
- * then try again against whatever leader the tracker has found by then.
- */
 const FULL_SYNC_RETRY_WAIT_MS  = 1500;
 const FULL_SYNC_RETRY_ATTEMPTS = 2;
 
 /**
- * Ask the leader for its committed log and send it to a newly connected client.
- *
- * Goes directly to GET /committed-log on the known leader — no pre-flight /status
- * call needed (leaderTracker already guarantees the URL is a current Leader).
- *
- * Retry logic (graceful failover):
- *   If the first attempt fails (leader just died), we wait FULL_SYNC_RETRY_WAIT_MS
- *   and retry — by then leaderTracker will usually have elected a new leader.
- *   After FULL_SYNC_RETRY_ATTEMPTS failures we fall back to an empty sync so
- *   the client can still start drawing (it will receive future strokes via broadcast).
+ * Ask the leader for the committed log of a specific board and send it to the client.
+ * Calls GET /committed-log?boardId=X on the leader.
  */
-async function sendFullSync(ws) {
+async function sendFullSync(ws, boardId) {
+  const bid = boardId || DEFAULT_BOARD;
+
   for (let attempt = 1; attempt <= FULL_SYNC_RETRY_ATTEMPTS; attempt++) {
     const leaderUrl = leaderTracker.getLeader();
 
     if (!leaderUrl) {
       if (attempt < FULL_SYNC_RETRY_ATTEMPTS) {
-        // Still in failover — wait for the tracker to find a new leader
         gwarn(
-          `Full-sync attempt ${attempt} for client #${ws.id}: no leader yet — ` +
-          `waiting ${FULL_SYNC_RETRY_WAIT_MS}ms for failover to resolve`
+          `Full-sync attempt ${attempt} for client #${ws.id} (board=${bid}): no leader yet — ` +
+          `waiting ${FULL_SYNC_RETRY_WAIT_MS}ms`
         );
         await new Promise(r => setTimeout(r, FULL_SYNC_RETRY_WAIT_MS));
         continue;
       }
-      // Final attempt, still no leader — send empty sync
-      sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-      gwarn(`Full-sync: no leader — sent empty sync to client #${ws.id}`);
+      sendToClient(ws, { type: 'full-sync', boardId: bid, data: { strokes: [] } });
+      gwarn(`Full-sync: no leader — sent empty sync to client #${ws.id} (board=${bid})`);
       return;
     }
 
     try {
-      const logRes  = await axios.get(`${leaderUrl}/committed-log`, { timeout: 2000 });
+      const logRes  = await axios.get(`${leaderUrl}/committed-log`, {
+        params:  { boardId: bid },
+        timeout: 2000,
+      });
       const strokes = logRes.data.strokes || [];
-      sendToClient(ws, { type: 'full-sync', data: { strokes } });
-      // [OBS-6] Normalized: always includes clientId, strokeCount, leaderUrl, attempt
+      sendToClient(ws, { type: 'full-sync', boardId: bid, data: { strokes } });
       ginfo(
-        `Full-sync → client #${ws.id}: ${strokes.length} stroke(s) from ${leaderUrl}` +
+        `Full-sync → client #${ws.id} (board=${bid}): ${strokes.length} stroke(s) from ${leaderUrl}` +
         (attempt > 1 ? ` (attempt ${attempt})` : '')
       );
-      return; // Success
+      return;
     } catch (err) {
-      gwarn(`Full-sync attempt ${attempt} failed for client #${ws.id}: ${err.message}`);
+      gwarn(`Full-sync attempt ${attempt} failed for client #${ws.id} (board=${bid}): ${err.message}`);
       if (attempt < FULL_SYNC_RETRY_ATTEMPTS) {
-        // Leader became unreachable — wait for tracker to re-discover
         await new Promise(r => setTimeout(r, FULL_SYNC_RETRY_WAIT_MS));
       }
     }
   }
 
-  // All attempts failed — send empty sync so client can still draw
-  sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-  gwarn(`Full-sync: all ${FULL_SYNC_RETRY_ATTEMPTS} attempts failed for client #${ws.id} — sent empty sync`);
+  sendToClient(ws, { type: 'full-sync', boardId: bid, data: { strokes: [] } });
+  gwarn(`Full-sync: all attempts failed for client #${ws.id} (board=${bid}) — sent empty sync`);
 }
 
-// ── WebSocket event handling ────────────────────────────────────────────────
+// ── WebSocket event handling ───────────────────────────────────────────────────
 wss.on('connection', (ws, req) => {
-  ws.id = ++clientIdCounter;
-  clients.add(ws);
+  ws.id     = ++clientIdCounter;
+  ws.boardId = null;
+  unjoinedClients.add(ws);
 
   const clientIp = req.socket.remoteAddress || 'unknown';
-  ginfo(`Client #${ws.id} connected from ${clientIp} — total: ${clients.size}`);
+  ginfo(`Client #${ws.id} connected from ${clientIp}`);
 
-  // If a failover is in progress right now, tell this client immediately so
-  // it can show a "leader changing" indicator in the UI while we do the full-sync
+  // Inform newly connected client if a failover is in progress
   if (leaderTracker.isFailoverInProgress()) {
     sendToClient(ws, {
       type: 'leader-changing',
@@ -166,10 +231,7 @@ wss.on('connection', (ws, req) => {
     });
   }
 
-  // Send full canvas state immediately on connect (FR-FE-10, FR-GW-05)
-  sendFullSync(ws);
-
-  // ── Incoming messages from client ─────────────────────────────────────
+  // ── Incoming messages from client ────────────────────────────────────────
   ws.on('message', (raw) => {
     let msg;
     try {
@@ -182,18 +244,29 @@ wss.on('connection', (ws, req) => {
 
     switch (msg.type) {
 
-      case 'stroke':
-        // Validate minimal stroke shape before forwarding
+      // ── join-board: client enters a room and gets full-sync ────────────
+      case 'join-board': {
+        const boardId = (msg.boardId || DEFAULT_BOARD).trim().slice(0, 64);
+        unjoinedClients.delete(ws);
+        _joinRoom(ws, boardId);
+        ginfo(`Client #${ws.id} joined board "${boardId}" — room size: ${_getRoom(boardId).size}`);
+        sendFullSync(ws, boardId);
+        break;
+      }
+
+      // ── stroke: forward to leader with boardId ─────────────────────────
+      case 'stroke': {
         if (!msg.data || !Array.isArray(msg.data.points) || msg.data.points.length === 0) {
           sendToClient(ws, { type: 'error', data: { message: 'Invalid stroke payload' } });
           return;
         }
-        ginfo(`Client #${ws.id} sent stroke — forwarding to leader`);
-        // Forward to leader — leaderTracker handles queuing if no leader is known
-        leaderTracker.forwardStroke(msg.data).catch((err) => {
-          gerror(`forwardStroke error: ${err.message}`);
+        const boardId = msg.boardId || ws.boardId || DEFAULT_BOARD;
+        ginfo(`Client #${ws.id} sent stroke (board=${boardId}) — forwarding to leader`);
+        leaderTracker.forwardStroke(msg.data, boardId).catch((err) => {
+          gerror(`forwardStroke error (board=${boardId}): ${err.message}`);
         });
         break;
+      }
 
       case 'ping':
         sendToClient(ws, { type: 'pong' });
@@ -204,60 +277,66 @@ wss.on('connection', (ws, req) => {
     }
   });
 
-  // ── Connection closed ────────────────────────────────────────────
+  // ── Connection closed ────────────────────────────────────────────────
   ws.on('close', (code, reason) => {
-    clients.delete(ws);
-    // [BUG-6 FIX] reason is a Buffer in the ws library — must .toString() for human-readable log
+    unjoinedClients.delete(ws);
+    _leaveRoom(ws);
     const reasonStr = reason && reason.length > 0 ? reason.toString() : 'none';
     ginfo(
-      `Client #${ws.id} disconnected` +
-      ` (code=${code}, reason=${reasonStr}) — remaining: ${clients.size}`
+      `Client #${ws.id} disconnected (board=${ws.boardId || 'none'})` +
+      ` (code=${code}, reason=${reasonStr})`
     );
   });
 
-  // ── Connection error ─────────────────────────────────────────────
+  // ── Connection error ─────────────────────────────────────────────────
   ws.on('error', (err) => {
     gerror(`Client #${ws.id} socket error: ${err.message}`);
-    clients.delete(ws);
+    unjoinedClients.delete(ws);
+    _leaveRoom(ws);
   });
 });
 
-// ── HTTP: Leader → Gateway → All clients ──────────────────────────────────────
+// ── HTTP: Leader → Gateway → Board clients ────────────────────────────────────
 /**
  * POST /broadcast
  * Called by the Leader after committing a log entry.
- * Pushes the committed stroke to every connected WebSocket client.
+ * Body: { boardId, stroke: { index, points, color, width, ... } }
  *
- * Body: { stroke: { index, points, color, width, userId? } }
- * Shape matches SRS §6.2 /broadcast spec.
+ * Pushes the committed stroke ONLY to clients on the matching board.
+ * Also sends a user-count update for the board.
  */
 app.post('/broadcast', (req, res) => {
-  const { stroke } = req.body;
+  const { boardId, stroke } = req.body;
+  const bid = boardId || DEFAULT_BOARD;
 
   if (!stroke || stroke.index === undefined) {
     return res.status(400).json({ success: false, error: 'Missing stroke or stroke.index' });
   }
 
-  const sent = broadcast({ type: 'stroke-committed', data: stroke });
+  const sent = broadcastToBoard(bid, { type: 'stroke-committed', boardId: bid, data: stroke });
 
-  ginfo(`/broadcast — index=${stroke.index} — pushed to ${sent}/${clients.size} client(s)`);
+  ginfo(`/broadcast board=${bid} — index=${stroke.index} — pushed to ${sent} client(s)`);
 
-  res.json({ success: true, clientsNotified: sent });
+  res.json({ success: true, boardId: bid, clientsNotified: sent });
 });
 
 // ── HTTP: Health / Status ─────────────────────────────────────────────────────
 /**
  * GET /health
- * Returns gateway liveness, the currently tracked leader URL, connected
- * client count, pending stroke queue depth, and whether a failover is in progress.
- * Shape: { status, leader, clients, queueDepth, failoverActive }
+ * Returns gateway liveness, currently tracked leader URL, board count,
+ * total connected clients, queue depth, and failover state.
  */
 app.get('/health', (req, res) => {
   const stats = leaderTracker.getStats();
+
+  let totalClients = unjoinedClients.size;
+  for (const room of boardClients.values()) totalClients += room.size;
+
   res.json({
     status:        'ok',
     leader:        stats.leader,
-    clients:       clients.size,
+    clients:       totalClients,
+    boardCount:    boardClients.size,
     queueDepth:    stats.queueDepth,
     failoverActive: stats.failoverActive,
   });
@@ -265,10 +344,15 @@ app.get('/health', (req, res) => {
 
 app.get('/status', (req, res) => {
   const stats = leaderTracker.getStats();
+
+  let totalClients = unjoinedClients.size;
+  for (const room of boardClients.values()) totalClients += room.size;
+
   res.json({
     status:        'ok',
     leader:        stats.leader,
-    clients:       clients.size,
+    clients:       totalClients,
+    boardCount:    boardClients.size,
     queueDepth:    stats.queueDepth,
     failoverActive: stats.failoverActive,
   });
@@ -276,7 +360,6 @@ app.get('/status', (req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
-// Log every leader transition detected by the tracker
 leaderTracker.onLeaderChange((newLeader, prevLeader) => {
   if (newLeader) {
     ginfo(`Leader changed: ${prevLeader || 'none'} → ${newLeader}`);
@@ -285,29 +368,17 @@ leaderTracker.onLeaderChange((newLeader, prevLeader) => {
   }
 });
 
-/**
- * Broadcast failover state changes to ALL connected WebSocket clients.
- *
- *  isActive=true  → leadership is changing; strokes are queued
- *                   clients receive  { type: 'leader-changing', data: { message } }
- *                   so they can show an "election in progress" status pill
- *                   WITHOUT closing the WebSocket connection.
- *
- *  isActive=false → new leader found, queue drained; system is healthy again
- *                   clients receive  { type: 'leader-restored', data: { leader } }
- *                   so they can update the leader badge and hide the indicator.
- */
 leaderTracker.onFailoverStateChange((isActive) => {
   if (isActive) {
     ginfo('⚡ Failover started — broadcasting leader-changing to all clients');
-    broadcast({
+    broadcastAll({
       type: 'leader-changing',
       data: { message: 'Leader election in progress — your strokes are safely queued' },
     });
   } else {
     const newLeader = leaderTracker.getLeader();
     ginfo(`✅ Failover complete — broadcasting leader-restored (${newLeader})`);
-    broadcast({
+    broadcastAll({
       type: 'leader-restored',
       data: { leader: newLeader },
     });

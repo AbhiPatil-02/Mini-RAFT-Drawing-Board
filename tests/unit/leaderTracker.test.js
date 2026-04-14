@@ -188,7 +188,7 @@ describe('forwardStroke() — success path', () => {
     expect(result).toMatchObject({ success: true, index: 1 });
     expect(axiosMock.post).toHaveBeenCalledWith(
       expect.stringContaining('/client-stroke'),
-      { stroke: STROKE },
+      { stroke: STROKE, boardId: 'board-public' },
       expect.objectContaining({ timeout: expect.any(Number) })
     );
   });
