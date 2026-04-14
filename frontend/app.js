@@ -726,3 +726,236 @@ connect();            // Open WebSocket to Gateway (triggers full-sync)
 startHealthPolling(); // Poll /health every 3 s for leader info + queue depth
 
 console.log('[Frontend] Mini-RAFT Drawing Board initialised');
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXPORT  (PNG + PDF)
+// ══════════════════════════════════════════════════════════════════════════════
+
+const exportGroup    = document.getElementById('export-group');
+const exportBtn      = document.getElementById('btn-export');
+const exportDropdown = document.getElementById('export-dropdown');
+const exportPngBtn   = document.getElementById('btn-export-png');
+const exportPdfBtn   = document.getElementById('btn-export-pdf');
+const exportModal    = document.getElementById('export-modal');
+const exportModalMsg = document.getElementById('export-modal-msg');
+
+// ── Dropdown toggle ────────────────────────────────────────────────────────
+
+function openExportDropdown() {
+  exportDropdown.classList.add('open');
+  exportBtn.classList.add('open');
+  exportBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeExportDropdown() {
+  exportDropdown.classList.remove('open');
+  exportBtn.classList.remove('open');
+  exportBtn.setAttribute('aria-expanded', 'false');
+}
+
+exportBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const isOpen = exportDropdown.classList.contains('open');
+  if (isOpen) {
+    closeExportDropdown();
+  } else {
+    openExportDropdown();
+  }
+});
+
+// Close dropdown when clicking outside
+document.addEventListener('click', (e) => {
+  if (!exportGroup.contains(e.target)) {
+    closeExportDropdown();
+  }
+});
+
+// Close on Escape
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeExportDropdown();
+});
+
+// ── Modal helpers ──────────────────────────────────────────────────────────
+
+function showExportModal(message = 'Preparing export…') {
+  exportModalMsg.textContent = message;
+  exportModal.classList.remove('hidden');
+}
+
+function hideExportModal() {
+  exportModal.classList.add('hidden');
+}
+
+// ── Snapshot helper ────────────────────────────────────────────────────────
+/**
+ * Returns a promise that resolves with a Blob of the current board as PNG.
+ *
+ * Strategy: draw the board onto an off-screen canvas with an explicit white
+ * background so the exported image never has a transparent or dark background,
+ * regardless of what the live canvas holds.
+ */
+function getBoardBlob() {
+  return new Promise((resolve, reject) => {
+    // Off-screen canvas at the same physical pixel size
+    const offscreen = document.createElement('canvas');
+    offscreen.width  = canvas.width;
+    offscreen.height = canvas.height;
+
+    const octx = offscreen.getContext('2d');
+
+    // 1. White background
+    octx.fillStyle = CANVAS_BG;
+    octx.fillRect(0, 0, offscreen.width, offscreen.height);
+
+    // 2. Copy committed strokes (re-render at full resolution)
+    octx.save();
+    octx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    for (const stroke of committedStrokes) {
+      if (!stroke.points || stroke.points.length < 2) continue;
+      octx.beginPath();
+      octx.lineCap    = 'round';
+      octx.lineJoin   = 'round';
+      octx.strokeStyle = stroke.color === 'eraser' ? CANVAS_BG : stroke.color;
+      octx.lineWidth  = stroke.width;
+      const [first, ...rest] = stroke.points;
+      octx.moveTo(first.x, first.y);
+      for (const pt of rest) octx.lineTo(pt.x, pt.y);
+      octx.stroke();
+    }
+    octx.restore();
+
+    offscreen.toBlob((blob) => {
+      if (blob) { resolve(blob); }
+      else      { reject(new Error('Canvas toBlob returned null')); }
+    }, 'image/png');
+  });
+}
+
+// ── PNG export ─────────────────────────────────────────────────────────────
+
+async function exportPNG() {
+  closeExportDropdown();
+
+  if (committedStrokes.length === 0 && pendingStrokes.length === 0) {
+    showToast('Nothing to export — draw something first 🎨', 'warn', 3000);
+    return;
+  }
+
+  showExportModal('Generating PNG…');
+
+  try {
+    const blob    = await getBoardBlob();
+    const url     = URL.createObjectURL(blob);
+    const anchor  = document.createElement('a');
+    const ts      = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    anchor.href     = url;
+    anchor.download = `mini-raft-board-${ts}.png`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+
+    // Revoke the object URL after a short delay so the download has time to start
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    showToast('PNG downloaded ✅', 'success', 3000);
+    console.log('[Export] PNG saved');
+  } catch (err) {
+    console.error('[Export] PNG failed:', err);
+    showToast('PNG export failed — see console for details', 'error');
+  } finally {
+    hideExportModal();
+  }
+}
+
+// ── PDF export (print-window strategy) ─────────────────────────────────────
+/**
+ * Opens a hidden window containing just the board image and calls window.print()
+ * on it, which lets the browser render a clean PDF with system print-to-PDF.
+ *
+ * Advantages over jsPDF:
+ *  - Zero third-party dependencies
+ *  - Exact pixel-perfect rendering at any resolution
+ *  - Browser handles page size / DPI negotiation natively
+ */
+async function exportPDF() {
+  closeExportDropdown();
+
+  if (committedStrokes.length === 0 && pendingStrokes.length === 0) {
+    showToast('Nothing to export — draw something first 🎨', 'warn', 3000);
+    return;
+  }
+
+  showExportModal('Generating PDF…');
+
+  try {
+    const blob    = await getBoardBlob();
+    const dataUrl = await blobToDataURL(blob);
+
+    // Determine aspect ratio for the print page
+    const cssW    = canvas.width  / window.devicePixelRatio;
+    const cssH    = canvas.height / window.devicePixelRatio;
+    const ratio   = cssH / cssW;
+
+    const ts      = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+    const printWin = window.open('', '_blank', 'width=800,height=600');
+    if (!printWin) {
+      showToast('Pop-up blocked — please allow pop-ups for this page and retry', 'warn', 5000);
+      return;
+    }
+
+    printWin.document.write(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8"/>
+  <title>Mini-RAFT Board — ${ts}</title>
+  <style>
+    @page { margin: 0; size: auto; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #fff; }
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-height: 100vh;
+      object-fit: contain;
+      page-break-inside: avoid;
+    }
+  </style>
+</head>
+<body>
+  <img src="${dataUrl}" alt="Mini-RAFT Drawing Board export"/>
+  <script>
+    window.onload = function() {
+      setTimeout(function() { window.print(); window.close(); }, 400);
+    };
+  <\/script>
+</body>
+</html>`);
+    printWin.document.close();
+
+    showToast('PDF print dialog opened 🖨️ — save as PDF', 'success', 5000);
+    console.log('[Export] PDF print window opened');
+  } catch (err) {
+    console.error('[Export] PDF failed:', err);
+    showToast('PDF export failed — see console for details', 'error');
+  } finally {
+    // Hide the modal after a moment so it doesn't cover the print dialog
+    setTimeout(hideExportModal, 600);
+  }
+}
+
+/** Convert a Blob to a base-64 data URL (needed for the print window). */
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+// ── Wire up export buttons ─────────────────────────────────────────────────
+
+exportPngBtn.addEventListener('click', exportPNG);
+exportPdfBtn.addEventListener('click', exportPDF);

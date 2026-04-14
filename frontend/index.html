@@ -64,6 +64,31 @@
 
         <!-- Actions -->
         <button class="action-btn" id="btn-clear" title="Clear canvas (local only)">Clear</button>
+
+        <div class="tool-divider"></div>
+
+        <!-- Export -->
+        <div class="export-group" id="export-group">
+          <button class="export-btn" id="btn-export" title="Export board" aria-haspopup="true" aria-expanded="false">
+            <span class="export-icon">⬇</span> Export
+          </button>
+          <div class="export-dropdown" id="export-dropdown" role="menu">
+            <button class="export-item" id="btn-export-png" role="menuitem">
+              <span class="export-item-icon">🖼</span>
+              <span>
+                <strong>PNG</strong>
+                <small>Lossless image</small>
+              </span>
+            </button>
+            <button class="export-item" id="btn-export-pdf" role="menuitem">
+              <span class="export-item-icon">📄</span>
+              <span>
+                <strong>PDF</strong>
+                <small>Print-ready document</small>
+              </span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -95,6 +120,14 @@
 
   <!-- ── Toast notifications ──────────────────────────────────────────────── -->
   <div id="toast-container" aria-live="assertive"></div>
+
+  <!-- ── Export progress modal ─────────────────────────────────────────────── -->
+  <div id="export-modal" class="export-modal hidden" role="dialog" aria-modal="true" aria-label="Export in progress">
+    <div class="export-modal-card">
+      <div class="export-modal-spinner"></div>
+      <p id="export-modal-msg">Preparing export…</p>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>
