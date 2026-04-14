@@ -1,39 +1,33 @@
 /**
- * raft.js — Mini-RAFT State Machine
+ * raft.js — Mini-RAFT State Machine  (Multi-Tenant Edition)
  *
  * States: Follower | Candidate | Leader
  *
- * Implements (Week 2):
- *  ✓ becomeFollower()        — step down, reset timers, clear voted state
- *  ✓ becomeCandidate()       — increment term, vote for self, stop heartbeats
- *  ✓ becomeLeader()          — start heartbeat interval, send immediate heartbeat
- *  ✓ startElection()         — parallel RequestVote, majority check, step-down on higher term
- *  ✓ sendHeartbeats()        — POST /heartbeat to ALL peers in PARALLEL; step down if higher term seen
- *  ✓ handleRequestVote()     — full log-up-to-date check (lastLogTerm + lastLogIndex)
- *  ✓ handleHeartbeat()       — reset timer, update term, advance commitIndex
- *  ✓ handleAppendEntries()   — consistency check, conflict truncation, append, advance commitIndex
- *  ✓ handleClientStroke()    — append → parallel AppendEntries → majority ACK → commit → notify Gateway
- *  ✓ handleSyncLog()         — bulk catch-up: append all missing entries from leader
- *  ✓ triggerSyncLog()        — leader sends missing entries to a lagging follower
- *  ✓ notifyGateway()         — POST /broadcast to Gateway after commit
+ * Multi-tenant changes (Week 3):
+ *  ✓ boardLogs: Map<boardId, StrokeLog>   — one log per board (lazy-initialised)
+ *  ✓ boardCommitIndex: Map<boardId, number> — one commitIndex per board
+ *  ✓ handleClientStroke(stroke, boardId)  — board-scoped append + replication
+ *  ✓ handleAppendEntries/handleSyncLog    — route by boardId
+ *  ✓ handleHeartbeat                      — advances per-board commitIndex
+ *  ✓ notifyGateway(entry, boardId)        — POST /broadcast with boardId
+ *  ✓ getCommittedLog(boardId)             — returns committed strokes for one board
+ *  ✓ _lastIndex(boardId) / _lastTerm(boardId) — board-scoped log helpers
+ *
+ * All RAFT correctness (election, term checks, log safety) is unchanged.
  *
  * Fix log (audit):
- *  [BUG-2] sendHeartbeats: sequential for-of+await → parallel Promise.allSettled
- *          (prevents false elections when one peer is slow)
- *  [BUG-1] handleClientStroke: leaderCommit in AppendEntries now uses post-commit
- *          entry.index so followers commit the entry immediately, not after next heartbeat
- *  [OBS-1] All log lines now carry an ISO-8601 timestamp prefix
- *  [OBS-2] Explicit [INFO] / [WARN] / [ERROR] severity tags throughout
- *  [OBS-7] sendHeartbeats emits a summary log when any peer is lagging
+ *  [BUG-2] sendHeartbeats: parallel Promise.allSettled (no false elections)
+ *  [BUG-1] leaderCommit in AppendEntries uses post-commit entry.index
+ *  [OBS-1] ISO-8601 timestamps on all log lines
+ *  [OBS-2] Explicit [INFO] / [WARN] / [ERROR] severity tags
+ *  [OBS-7] sendHeartbeats emits a summary when any peer is lagging
  */
 
-const axios  = require('axios');
-const config = require('./config');
-const log    = require('./log');
+const axios      = require('axios');
+const config     = require('./config');
+const StrokeLog  = require('./log');  // class, not singleton
 
 // ── Structured logger ─────────────────────────────────────────────────────────
-// All log lines carry an ISO timestamp + replica ID + severity tag so that
-// docker logs across replicas can be correlated and grepped by level.
 const _ts = () => new Date().toISOString();
 
 const LEVELS = {
@@ -51,8 +45,8 @@ function _log(level, msg) {
 }
 
 const debug = (msg) => _log('DEBUG', msg);
-const info  = (msg) => _log('INFO', msg);
-const warn  = (msg) => _log('WARN', msg);
+const info  = (msg) => _log('INFO',  msg);
+const warn  = (msg) => _log('WARN',  msg);
 const error = (msg) => _log('ERROR', msg);
 
 function summarizeStroke(stroke) {
@@ -62,27 +56,86 @@ function summarizeStroke(stroke) {
   return `stroke(points=${points}, color=${color}, width=${width})`;
 }
 
-function logCommitEvent(entry, source) {
+function logCommitEvent(entry, boardId, source) {
   if (!entry) return;
   info(
-    `COMMIT index=${entry.index}, term=${entry.term}, ${summarizeStroke(entry.stroke)}` +
-    `, source=${source}`
+    `COMMIT board=${boardId} index=${entry.index}, term=${entry.term},` +
+    ` ${summarizeStroke(entry.stroke)}, source=${source}`
   );
 }
 
-// ── State variables ───────────────────────────────────────────────────────────
+// ── Global RAFT state ─────────────────────────────────────────────────────────
 let state         = 'Follower';  // 'Follower' | 'Candidate' | 'Leader'
 let currentTerm   = 0;
 let votedFor      = null;        // replicaId string or null
-let commitIndex   = 0;
 let currentLeader = null;
 
 let electionTimer      = null;
 let heartbeatTimer     = null;
-let electionInProgress = false; // Guard against re-entrant election calls
+let electionInProgress = false;
+
+// ── Per-board state ───────────────────────────────────────────────────────────
+/**
+ * boardLogs: Map<boardId, StrokeLog>
+ * Each board has its own independent append-only log.
+ * Created lazily on first access via _getLog(boardId).
+ */
+const boardLogs        = new Map();  // boardId → StrokeLog instance
+const boardCommitIndex = new Map();  // boardId → commitIndex (number, default 0)
+
+const DEFAULT_BOARD = 'board-public';
+
+/**
+ * Lazily retrieve (or create) the StrokeLog for a given boardId.
+ */
+function _getLog(boardId) {
+  const id = boardId || DEFAULT_BOARD;
+  if (!boardLogs.has(id)) {
+    boardLogs.set(id, new StrokeLog());
+    boardCommitIndex.set(id, 0);
+  }
+  return boardLogs.get(id);
+}
+
+function _getCommitIndex(boardId) {
+  const id = boardId || DEFAULT_BOARD;
+  return boardCommitIndex.get(id) ?? 0;
+}
+
+function _setCommitIndex(boardId, index) {
+  const id = boardId || DEFAULT_BOARD;
+  boardCommitIndex.set(id, index);
+}
+
+/**
+ * Board-scoped lastIndex (uses global log if backwards-compat needed for election RPCs).
+ * For election log-up-to-date checks we need a global view — use the max across all boards.
+ */
+function _globalLastIndex() {
+  if (boardLogs.size === 0) return 0;
+  let max = 0;
+  for (const log of boardLogs.values()) {
+    if (log.lastIndex() > max) max = log.lastIndex();
+  }
+  return max;
+}
+
+function _globalLastTerm() {
+  if (boardLogs.size === 0) return 0;
+  let latestTerm = 0;
+  let latestIndex = 0;
+  for (const log of boardLogs.values()) {
+    const li = log.lastIndex();
+    const lt = log.lastTerm();
+    if (li > latestIndex || (li === latestIndex && lt > latestTerm)) {
+      latestIndex = li;
+      latestTerm  = lt;
+    }
+  }
+  return latestTerm;
+}
 
 // ── Cluster constants ─────────────────────────────────────────────────────────
-// Total nodes = self + peers (3 for standard setup)
 const CLUSTER_SIZE = config.PEERS.length + 1;
 const MAJORITY     = Math.floor(CLUSTER_SIZE / 2) + 1; // 2 of 3
 
@@ -112,46 +165,32 @@ function clearHeartbeatTimer() {
 
 // ── State Transitions ─────────────────────────────────────────────────────────
 
-/**
- * Transition to Follower.
- * Called on: boot, higher-term RPC received, lost election, step-down from Leader.
- * Resets votedFor so this node can vote again in the new term.
- */
 function becomeFollower(term) {
   const prev = state;
   state       = 'Follower';
   currentTerm = term;
   votedFor    = null;
   clearHeartbeatTimer();
-  resetElectionTimer(); // Start waiting for a heartbeat from the leader
+  resetElectionTimer();
   info(
     `→ FOLLOWER  (term ${term})` +
     (prev === 'Leader' ? ' [stepped down from Leader]' : '')
   );
 }
 
-/**
- * Transition to Candidate.
- * Increments term, self-votes, stops heartbeat sender.
- * Actual vote-request RPCs are sent by startElection() right after.
- */
 function becomeCandidate() {
   state       = 'Candidate';
   currentTerm += 1;
-  votedFor    = config.REPLICA_ID; // vote for self
+  votedFor    = config.REPLICA_ID;
   clearHeartbeatTimer();
   info(`→ CANDIDATE (term ${currentTerm})`);
 }
 
-/**
- * Transition to Leader.
- * Stops election timer, starts heartbeat interval, sends an immediate heartbeat.
- */
 function becomeLeader() {
   state         = 'Leader';
   currentLeader = config.REPLICA_ID;
-  clearElectionTimer(); // Leaders never wait for elections
-  sendHeartbeats();     // Assert authority immediately
+  clearElectionTimer();
+  sendHeartbeats();
   heartbeatTimer = setInterval(sendHeartbeats, config.HEARTBEAT_INTERVAL_MS);
   info(
     `→ LEADER    (term ${currentTerm})` +
@@ -161,22 +200,19 @@ function becomeLeader() {
 
 // ── Leader Election ───────────────────────────────────────────────────────────
 
-/**
- * Fired when the election timeout expires without receiving a heartbeat.
- * Converts this node to Candidate and sends RequestVote RPCs to all peers.
- */
 async function startElection() {
-  if (state === 'Leader') return; // Safety guard
-  if (electionInProgress) return; // Prevent re-entrant elections
+  if (state === 'Leader') return;
+  if (electionInProgress) return;
 
   electionInProgress = true;
   becomeCandidate();
 
-  let votes       = 1; // Self-vote already recorded in becomeCandidate()
+  let votes       = 1;
   let steppedDown = false;
 
-  const reqLastLogIndex = log.lastIndex();
-  const reqLastLogTerm  = log.lastTerm();
+  // Use global last index/term for election log-up-to-date check
+  const reqLastLogIndex = _globalLastIndex();
+  const reqLastLogTerm  = _globalLastTerm();
 
   info(`Requesting votes from ${config.PEERS.length} peer(s)...`);
 
@@ -194,7 +230,6 @@ async function startElection() {
       }, { timeout: config.RPC_TIMEOUT_MS });
 
       if (res.data.term > currentTerm) {
-        // Discovered a higher term — revert immediately
         info(`Higher term (${res.data.term}) from ${peer} — stepping down`);
         becomeFollower(res.data.term);
         steppedDown = true;
@@ -215,13 +250,11 @@ async function startElection() {
   await Promise.allSettled(voteRequests);
   electionInProgress = false;
 
-  // Re-check — could have stepped down during RPC round-trips
   if (steppedDown || state !== 'Candidate') return;
 
   if (votes >= MAJORITY) {
     becomeLeader();
   } else {
-    // Split vote — revert; random election timeout will trigger another attempt
     warn(
       `Election failed — votes: ${votes}/${MAJORITY} needed. Retrying after next timeout.`
     );
@@ -232,30 +265,40 @@ async function startElection() {
 // ── Heartbeat Sender (Leader → Followers) ─────────────────────────────────────
 
 /**
- * Broadcasts heartbeats to all peers IN PARALLEL to suppress their election timers.
- * Using Promise.allSettled prevents one slow/dead peer from blocking heartbeats
- * to the others — eliminating false elections when a single peer has high latency.
+ * Broadcasts heartbeats to all peers IN PARALLEL.
+ * [BUG-2 FIX] Was sequential for-of + await; now parallel Promise.allSettled.
  *
- * [BUG-2 FIX] Was: sequential for-of + await (caused false elections under load)
- *             Now: parallel Promise.allSettled (all peers notified in one RTT)
+ * Heartbeat carries the global commitIndex summary — followers use this
+ * to advance their own commitIndex per board after board-specific AppendEntries.
+ * We send the per-board commitIndex map so followers stay in sync.
  */
 async function sendHeartbeats() {
   if (state !== 'Leader') return;
 
+  // Build a compact per-board commitIndex snapshot for the heartbeat
+  const boardCommits = {};
+  for (const [bid, ci] of boardCommitIndex.entries()) {
+    if (ci > 0) boardCommits[bid] = ci;
+  }
+
+  // Global commitIndex for backward-compat (max across boards)
+  const globalCommit = Math.max(0, ...[...boardCommitIndex.values()]);
+
   debug(
-    `Heartbeat tick (term=${currentTerm}, leaderCommit=${commitIndex}, peers=${config.PEERS.length})`
+    `Heartbeat tick (term=${currentTerm}, globalCommit=${globalCommit}, peers=${config.PEERS.length})`
   );
 
   const laggingPeers = [];
 
   await Promise.allSettled(
     config.PEERS.map(async (peer) => {
-      debug(`Heartbeat → ${peer} (term=${currentTerm}, leaderCommit=${commitIndex})`);
+      debug(`Heartbeat → ${peer} (term=${currentTerm})`);
       try {
         const res = await axios.post(`${peer}/heartbeat`, {
           term:         currentTerm,
           leaderId:     config.REPLICA_ID,
-          leaderCommit: commitIndex,
+          leaderCommit: globalCommit,
+          boardCommits,           // NEW: per-board commit indices
         }, { timeout: config.RPC_TIMEOUT_MS });
 
         debug(
@@ -269,57 +312,45 @@ async function sendHeartbeats() {
           return;
         }
 
-        // Proactive catch-up: if the follower's log is behind our commitIndex, send it
-        // the missing entries immediately — without waiting for an AppendEntries rejection.
-        // This is the key mechanism that makes a restarted node catch up automatically
-        // even when no new strokes arrive from clients.
         if (
           res.data.success &&
           typeof res.data.logLength === 'number' &&
-          res.data.logLength < commitIndex
+          res.data.logLength < globalCommit
         ) {
           laggingPeers.push(`${peer}(logLen=${res.data.logLength})`);
-          triggerSyncLog(peer, res.data.logLength).catch(() => {});
+          triggerSyncLog(peer, res.data.logLength, res.data.boardLogLengths || {}).catch(() => {});
         }
       } catch {
-        // Peer unreachable — it will eventually time out and start an election itself
-        // Intentionally silent: don't spam logs on every missed heartbeat pulse
         debug(`Heartbeat timeout/unreachable ← ${peer}`);
       }
     })
   );
 
-  // [OBS-7] Log a single summary line when any peer is lagging (avoids per-peer spam)
   if (laggingPeers.length > 0) {
     info(
-      `Lagging peer(s) detected (commitIndex=${commitIndex}): ${laggingPeers.join(', ')} — /sync-log triggered`
+      `Lagging peer(s) detected (globalCommit=${globalCommit}): ${laggingPeers.join(', ')} — /sync-log triggered`
     );
   }
 }
 
-// ── RPC Handlers (invoked by server.js routes) ────────────────────────────────
+// ── RPC Handlers ─────────────────────────────────────────────────────────────
 
 /**
  * POST /request-vote
- * Grants a vote if:
- *  1. Candidate's term >= our currentTerm
- *  2. We haven't voted yet this term (or voted for this same candidate)
- *  3. Candidate's log is at least as up-to-date as ours (RAFT §5.4):
- *     - candidate's lastLogTerm  > our lastTerm, OR
- *     - same lastLogTerm AND candidate's lastLogIndex >= our lastIndex
  */
 function handleRequestVote(body) {
   const { term, candidateId, lastLogIndex, lastLogTerm } = body;
 
-  // Step down if we see a higher term
   if (term > currentTerm) {
     becomeFollower(term);
   }
 
-  // Log up-to-date check (RAFT §5.4)
+  const myLastIndex = _globalLastIndex();
+  const myLastTerm  = _globalLastTerm();
+
   const logUpToDate =
-    lastLogTerm > log.lastTerm() ||
-    (lastLogTerm === log.lastTerm() && lastLogIndex >= log.lastIndex());
+    lastLogTerm > myLastTerm ||
+    (lastLogTerm === myLastTerm && lastLogIndex >= myLastIndex);
 
   const voteGranted =
     term >= currentTerm &&
@@ -328,7 +359,7 @@ function handleRequestVote(body) {
 
   if (voteGranted) {
     votedFor = candidateId;
-    resetElectionTimer(); // Valid candidate — reset our timer
+    resetElectionTimer();
     info(`✓ Voted for ${candidateId} in term ${term}`);
   } else {
     info(
@@ -342,19 +373,16 @@ function handleRequestVote(body) {
 
 /**
  * POST /heartbeat
- * - Rejects stale heartbeats (term < currentTerm)
- * - Steps down if term > currentTerm or if we are a Candidate and a leader appeared
- * - Advances commitIndex if leaderCommit > ours
+ * Advances per-board commitIndex from the boardCommits map in the heartbeat.
  */
 function handleHeartbeat(body) {
-  const { term, leaderId, leaderCommit } = body;
+  const { term, leaderId, leaderCommit, boardCommits = {} } = body;
 
   debug(
     `Heartbeat received ← ${leaderId}` +
     ` (term=${term}, leaderCommit=${leaderCommit}, currentTerm=${currentTerm})`
   );
 
-  // Reject stale leader
   if (term < currentTerm) {
     debug(`Heartbeat rejected as stale (incomingTerm=${term}, currentTerm=${currentTerm})`);
     return { term: currentTerm, success: false };
@@ -363,40 +391,46 @@ function handleHeartbeat(body) {
   if (term > currentTerm) {
     becomeFollower(term);
   } else if (state === 'Candidate') {
-    // A valid leader emerged during our election — give up candidacy
     becomeFollower(term);
   }
 
   currentLeader = leaderId;
-  resetElectionTimer(); // Leader is alive — suppress our election timer
+  resetElectionTimer();
 
-  // Advance commitIndex based on leader's committed knowledge
-  if (leaderCommit > commitIndex) {
-    const newCommit = Math.min(leaderCommit, log.lastIndex());
-    for (let i = commitIndex + 1; i <= newCommit; i++) {
-      log.commit(i);
-      logCommitEvent(log.getEntry(i), `heartbeat:${leaderId}`);
+  // Advance per-board commitIndex based on leader's knowledge
+  for (const [bid, leaderCI] of Object.entries(boardCommits)) {
+    const myCI = _getCommitIndex(bid);
+    if (leaderCI > myCI) {
+      const log       = _getLog(bid);
+      const newCommit = Math.min(leaderCI, log.lastIndex());
+      for (let i = myCI + 1; i <= newCommit; i++) {
+        log.commit(i);
+        logCommitEvent(log.getEntry(i), bid, `heartbeat:${leaderId}`);
+      }
+      _setCommitIndex(bid, newCommit);
+      info(`board=${bid} commitIndex → ${newCommit} (via heartbeat from ${leaderId})`);
     }
-    commitIndex = newCommit;
-    info(`commitIndex → ${commitIndex} (via heartbeat from ${leaderId})`);
   }
 
-  // Return logLength so the leader can detect if we are lagging and trigger /sync-log
-  return { term: currentTerm, success: true, logLength: log.length };
+  // Compute total log length across all boards for leader's lagging detection
+  let totalLogLength = 0;
+  const boardLogLengths = {};
+  for (const [bid, log] of boardLogs.entries()) {
+    boardLogLengths[bid] = log.length;
+    totalLogLength += log.length;
+  }
+
+  return { term: currentTerm, success: true, logLength: totalLogLength, boardLogLengths };
 }
 
 /**
  * POST /append-entries
- * Full RAFT AppendEntries RPC handler:
- *  1. Reject stale term
- *  2. Update state on valid term / suppress candidacy
- *  3. Log consistency check (prevLogIndex / prevLogTerm)
- *  4. Truncate conflicting uncommitted entries if needed
- *  5. Append the new entry (idempotent if already present)
- *  6. Advance commitIndex to match leader
+ * Routes log operations to the correct board's StrokeLog.
  */
 function handleAppendEntries(body) {
-  const { term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit } = body;
+  const { term, leaderId, prevLogIndex, prevLogTerm, entry, leaderCommit, boardId } = body;
+  const bid = boardId || DEFAULT_BOARD;
+  const log = _getLog(bid);
 
   // 1. Reject stale RPCs
   if (term < currentTerm) {
@@ -407,7 +441,7 @@ function handleAppendEntries(body) {
   if (term > currentTerm) {
     becomeFollower(term);
   } else if (state === 'Candidate') {
-    becomeFollower(term); // Valid leader asserted — step down from candidacy
+    becomeFollower(term);
   }
 
   currentLeader = leaderId;
@@ -418,21 +452,19 @@ function handleAppendEntries(body) {
     const prevEntry = log.getEntry(prevLogIndex);
 
     if (!prevEntry) {
-      // We don't have the expected previous entry — we're behind
       warn(
-        `Missing prevLogIndex=${prevLogIndex}` +
+        `board=${bid} Missing prevLogIndex=${prevLogIndex}` +
         ` — need sync (our logLength=${log.length})`
       );
-      return { term: currentTerm, success: false, logLength: log.length };
+      return { term: currentTerm, success: false, logLength: log.length, boardId: bid };
     }
 
     if (prevEntry.term !== prevLogTerm) {
-      // Log divergence — let leader trigger sync-log
       warn(
-        `Log conflict at index=${prevLogIndex}:` +
+        `board=${bid} Log conflict at index=${prevLogIndex}:` +
         ` expected term ${prevLogTerm}, got ${prevEntry.term}`
       );
-      return { term: currentTerm, success: false, logLength: log.length };
+      return { term: currentTerm, success: false, logLength: log.length, boardId: bid };
     }
   }
 
@@ -441,27 +473,27 @@ function handleAppendEntries(body) {
     const existing = log.getEntry(entry.index);
     if (existing) {
       if (existing.term !== entry.term) {
-        // Conflict: truncate from this index onward (never removes committed entries)
         log.truncateFrom(entry.index);
         log.append(entry.term, entry.stroke);
-        warn(`Conflict at index=${entry.index} — truncated and re-appended`);
+        warn(`board=${bid} Conflict at index=${entry.index} — truncated and re-appended`);
       }
-      // else: identical entry already present — idempotent, no-op
+      // else: identical entry already present — idempotent no-op
     } else {
       log.append(entry.term, entry.stroke);
-      info(`Appended entry index=${entry.index}, term=${entry.term}`);
+      info(`board=${bid} Appended entry index=${entry.index}, term=${entry.term}`);
     }
   }
 
-  // 6. Advance commitIndex
-  if (leaderCommit > commitIndex) {
+  // 6. Advance commitIndex for this board
+  const myCI = _getCommitIndex(bid);
+  if (leaderCommit > myCI) {
     const newCommit = Math.min(leaderCommit, log.lastIndex());
-    for (let i = commitIndex + 1; i <= newCommit; i++) {
+    for (let i = myCI + 1; i <= newCommit; i++) {
       log.commit(i);
-      logCommitEvent(log.getEntry(i), `append-entries:${leaderId}`);
+      logCommitEvent(log.getEntry(i), bid, `append-entries:${leaderId}`);
     }
-    commitIndex = newCommit;
-    info(`commitIndex → ${commitIndex} (via AppendEntries from ${leaderId})`);
+    _setCommitIndex(bid, newCommit);
+    info(`board=${bid} commitIndex → ${newCommit} (via AppendEntries from ${leaderId})`);
   }
 
   return { term: currentTerm, success: true };
@@ -470,10 +502,12 @@ function handleAppendEntries(body) {
 /**
  * POST /sync-log
  * Bulk catch-up: leader sends all committed entries the follower is missing.
- * Triggered by the leader after a follower rejects AppendEntries with logLength mismatch.
+ * Routes by boardId.
  */
 function handleSyncLog(body) {
-  const { term, leaderId, entries, leaderCommit } = body;
+  const { term, leaderId, entries, leaderCommit, boardId } = body;
+  const bid = boardId || DEFAULT_BOARD;
+  const log = _getLog(bid);
 
   if (term < currentTerm) {
     return { success: false, term: currentTerm };
@@ -486,30 +520,29 @@ function handleSyncLog(body) {
   currentLeader = leaderId;
   resetElectionTimer();
 
-  info(`/sync-log: received ${entries.length} entries from ${leaderId}`);
+  info(`board=${bid} /sync-log: received ${entries.length} entries from ${leaderId}`);
 
   for (const e of entries) {
     const existing = log.getEntry(e.index);
     if (!existing) {
       log.append(e.term, e.stroke);
-      info(`  sync-append  index=${e.index}, term=${e.term}`);
+      info(`  board=${bid} sync-append  index=${e.index}, term=${e.term}`);
     } else if (existing.term !== e.term) {
       log.truncateFrom(e.index);
       log.append(e.term, e.stroke);
-      warn(`  sync-replace index=${e.index} (term mismatch)`);
+      warn(`  board=${bid} sync-replace index=${e.index} (term mismatch)`);
     }
-    // else: exact match already present — idempotent
   }
 
-  // Advance commitIndex after bulk append
-  if (leaderCommit > commitIndex) {
+  const myCI = _getCommitIndex(bid);
+  if (leaderCommit > myCI) {
     const newCommit = Math.min(leaderCommit, log.lastIndex());
-    for (let i = commitIndex + 1; i <= newCommit; i++) {
+    for (let i = myCI + 1; i <= newCommit; i++) {
       log.commit(i);
-      logCommitEvent(log.getEntry(i), `sync-log:${leaderId}`);
+      logCommitEvent(log.getEntry(i), bid, `sync-log:${leaderId}`);
     }
-    commitIndex = newCommit;
-    info(`Post-sync commitIndex → ${commitIndex}`);
+    _setCommitIndex(bid, newCommit);
+    info(`board=${bid} Post-sync commitIndex → ${newCommit}`);
   }
 
   return { success: true, logLength: log.length };
@@ -519,29 +552,30 @@ function handleSyncLog(body) {
 
 /**
  * POST /client-stroke
- * Full replication pipeline (RAFT §5.3):
+ * Full replication pipeline with boardId routing.
  *  1. Reject if not Leader
- *  2. Append stroke to local log
- *  3. Send AppendEntries to all peers in parallel
- *     - Peer rejects with logLength mismatch → fire-and-forget triggerSyncLog
- *     - Peer replies higher term → step down
- *  4. Commit if majority (self + peers) ACKed
- *  5. Notify Gateway via POST /broadcast
+ *  2. Append stroke to boardLogs[boardId]
+ *  3. Send AppendEntries (with boardId) to all peers in parallel
+ *  4. Commit if majority ACKed
+ *  5. Notify Gateway with boardId
  */
-async function handleClientStroke(stroke) {
+async function handleClientStroke(stroke, boardId) {
   if (state !== 'Leader') {
     return { success: false, error: 'not leader', leader: currentLeader };
   }
 
-  // Step 1: Append to local log
+  const bid = boardId || DEFAULT_BOARD;
+  const log = _getLog(bid);
+
+  // Step 1: Append to board-specific local log
   const entry        = log.append(currentTerm, stroke);
   const prevLogIndex = entry.index - 1;
   const prevLogTerm  = prevLogIndex > 0 ? (log.getEntry(prevLogIndex)?.term ?? 0) : 0;
 
-  info(`Stroke received → appended index=${entry.index}, term=${currentTerm}`);
+  info(`board=${bid} Stroke received → appended index=${entry.index}, term=${currentTerm}`);
 
-  // Step 2: Replicate to all peers in parallel
-  let acks        = 1; // Leader's own append counts as an ACK
+  // Step 2: Replicate to all peers with boardId
+  let acks        = 1;
   let steppedDown = false;
 
   await Promise.allSettled(
@@ -552,20 +586,16 @@ async function handleClientStroke(stroke) {
           leaderId:     config.REPLICA_ID,
           prevLogIndex,
           prevLogTerm,
+          boardId:      bid,          // NEW: route to correct board log on follower
           entry: {
             index:  entry.index,
             term:   entry.term,
             stroke: entry.stroke,
           },
-          // [BUG-1 FIX] Send post-commit index so followers commit this entry
-          // immediately via AppendEntries, not waiting for the next heartbeat.
-          // Was: leaderCommit: commitIndex  (pre-commit — this entry excluded)
-          // Now: leaderCommit: entry.index  (post-commit — followers commit immediately)
-          leaderCommit: entry.index,
+          leaderCommit: entry.index,  // [BUG-1 FIX] post-commit — followers commit immediately
         }, { timeout: config.RPC_TIMEOUT_MS });
 
         if (res.data.term > currentTerm) {
-          // Higher term — must step down
           info(`Higher term (${res.data.term}) from ${peer} during replication — stepping down`);
           becomeFollower(res.data.term);
           steppedDown = true;
@@ -574,42 +604,40 @@ async function handleClientStroke(stroke) {
 
         if (res.data.success) {
           acks += 1;
-          info(`ACK from ${peer} for index=${entry.index} (acks: ${acks})`);
+          info(`ACK from ${peer} for board=${bid} index=${entry.index} (acks: ${acks})`);
         } else {
-          // Follower's log is behind — trigger sync (non-blocking, best-effort)
           const followerLen = res.data.logLength ?? 0;
           warn(
-            `${peer} rejected AppendEntries (logLength=${followerLen}) — triggering /sync-log`
+            `${peer} rejected AppendEntries for board=${bid}` +
+            ` (logLength=${followerLen}) — triggering /sync-log`
           );
-          triggerSyncLog(peer, followerLen).catch(() => {});
+          triggerSyncLog(peer, followerLen, {}, bid).catch(() => {});
         }
       } catch {
-        warn(`AppendEntries → ${peer} unreachable / timed out`);
+        warn(`AppendEntries → ${peer} unreachable / timed out (board=${bid})`);
       }
     })
   );
 
-  // If we stepped down during replication, do not commit
   if (steppedDown || state !== 'Leader') {
     return { success: false, error: 'leadership lost during replication' };
   }
 
   // Step 3: Commit on majority
   if (acks >= MAJORITY) {
-    commitIndex = entry.index;
+    _setCommitIndex(bid, entry.index);
     log.commit(entry.index);
-    logCommitEvent(entry, 'leader-local-quorum');
-    info(`✓ Committed index=${entry.index} (acks: ${acks}/${CLUSTER_SIZE})`);
+    logCommitEvent(entry, bid, 'leader-local-quorum');
+    info(`✓ board=${bid} Committed index=${entry.index} (acks: ${acks}/${CLUSTER_SIZE})`);
 
-    // Step 4: Notify Gateway → broadcasts committed stroke to all WS clients
-    await notifyGateway(entry);
+    // Step 4: Notify Gateway with boardId
+    await notifyGateway(entry, bid);
 
     return { success: true, index: entry.index };
   }
 
-  // No quorum — entry sits uncommitted (will be resolved on sync/catch-up)
   warn(
-    `✗ No quorum for index=${entry.index}` +
+    `✗ board=${bid} No quorum for index=${entry.index}` +
     ` — acks: ${acks}/${MAJORITY} needed`
   );
   return { success: false, error: 'no quorum', acks };
@@ -618,51 +646,77 @@ async function handleClientStroke(stroke) {
 // ── Sync-Log Trigger (Leader → Lagging Follower) ─────────────────────────────
 
 /**
- * Leader sends all entries from (followerLogLength + 1) onward to the lagging peer.
- * Called non-blocking when a follower rejects AppendEntries due to log being behind.
+ * Leader sends missing entries from a specific board (or all boards) to a peer.
+ *
+ * @param {string} peer           - Peer URL
+ * @param {number} followerLogLen - Follower's reported global log length
+ * @param {object} boardLogLens   - Per-board log lengths reported by follower
+ * @param {string} [targetBoardId] - If set, only sync this board
  */
-async function triggerSyncLog(peer, followerLogLength) {
-  const missingEntries = log.getFrom(followerLogLength + 1);
-  if (missingEntries.length === 0) return;
+async function triggerSyncLog(peer, followerLogLen, boardLogLens = {}, targetBoardId = null) {
+  const boardsToSync = targetBoardId
+    ? [[targetBoardId, _getLog(targetBoardId)]]
+    : [...boardLogs.entries()];
 
-  info(`Sending ${missingEntries.length} missing entries to ${peer} via /sync-log`);
+  for (const [bid, log] of boardsToSync) {
+    const followerBoardLen = boardLogLens[bid] ?? 0;
+    const missingEntries   = log.getFrom(followerBoardLen + 1);
+    if (missingEntries.length === 0) continue;
 
-  try {
-    await axios.post(`${peer}/sync-log`, {
-      term:         currentTerm,
-      leaderId:     config.REPLICA_ID,
-      entries:      missingEntries.map(e => ({ index: e.index, term: e.term, stroke: e.stroke })),
-      leaderCommit: commitIndex,
-    }, { timeout: config.RPC_TIMEOUT_MS * 5 }); // Generous timeout for bulk transfers
-  } catch (err) {
-    warn(`/sync-log to ${peer} failed: ${err.message}`);
+    info(`board=${bid} Sending ${missingEntries.length} missing entries to ${peer} via /sync-log`);
+
+    try {
+      await axios.post(`${peer}/sync-log`, {
+        term:         currentTerm,
+        leaderId:     config.REPLICA_ID,
+        boardId:      bid,
+        entries:      missingEntries.map(e => ({ index: e.index, term: e.term, stroke: e.stroke })),
+        leaderCommit: _getCommitIndex(bid),
+      }, { timeout: config.RPC_TIMEOUT_MS * 5 });
+    } catch (err) {
+      warn(`/sync-log to ${peer} for board=${bid} failed: ${err.message}`);
+    }
   }
 }
 
 // ── Gateway Notification ──────────────────────────────────────────────────────
 
 /**
- * After committing an entry, the Leader POSTs /broadcast to the Gateway.
- * The Gateway then pushes the stroke to all connected WebSocket clients.
+ * After committing an entry, POST /broadcast to Gateway with boardId.
+ * Gateway uses boardId to push stroke only to clients on the same board.
  */
-async function notifyGateway(entry) {
+async function notifyGateway(entry, boardId) {
+  const bid = boardId || DEFAULT_BOARD;
   try {
     await axios.post(`${config.GATEWAY_URL}/broadcast`, {
+      boardId: bid,
       stroke: {
         index: entry.index,
         ...entry.stroke,
       },
     }, { timeout: 1000 });
-    info(`Gateway notified — broadcast index=${entry.index}`);
+    info(`Gateway notified — board=${bid} broadcast index=${entry.index}`);
   } catch (err) {
-    warn(`Gateway notify failed (index=${entry.index}): ${err.message}`);
+    warn(`Gateway notify failed (board=${bid}, index=${entry.index}): ${err.message}`);
   }
+}
+
+// ── Public query: committed log for a given board ────────────────────────────
+
+/**
+ * Returns committed strokes for a specific board.
+ * Called by server.js GET /committed-log?boardId=X for Gateway full-sync.
+ */
+function getCommittedLog(boardId) {
+  const bid = boardId || DEFAULT_BOARD;
+  const log = _getLog(bid);
+  return log.getCommitted().map(e => ({ index: e.index, ...e.stroke }));
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 function start() {
-  info(`── Mini-RAFT node starting ──────────────────────`);
+  info(`── Mini-RAFT node starting (multi-tenant) ───────`);
   info(`   Peers       : ${config.PEERS.join(', ') || '(none)'}`);
   info(`   Cluster size: ${CLUSTER_SIZE}`);
   info(`   Majority    : ${MAJORITY}`);
@@ -670,28 +724,32 @@ function start() {
   info(`   Heartbeat   : every ${config.HEARTBEAT_INTERVAL_MS} ms`);
   info(`──────────────────────────────────────────────────`);
 
-  // Add a small startup jitter based on the replica ID digit so all three nodes
-  // don't fire their first election at exactly the same moment on Docker startup.
-  // replica1 → +0 ms, replica2 → +50 ms, replica3 → +100 ms (well within timeout window)
-  const idDigit   = parseInt(config.REPLICA_ID.replace(/\D/g, ''), 10) || 1;
-  const jitter    = (idDigit - 1) * 50;
+  const idDigit = parseInt(config.REPLICA_ID.replace(/\D/g, ''), 10) || 1;
+  const jitter  = (idDigit - 1) * 50;
   info(`Applying startup jitter: ${jitter} ms`);
   setTimeout(() => becomeFollower(0), jitter);
 }
 
 /**
  * Returns the current observable RAFT state.
- * Shape matches SRS §6.1 GET /status spec exactly:
- * { id, state, term, leader, logLength, commitIndex }
+ * Shape: { id, state, term, leader, logLength, commitIndex, boards }
  */
 function getStatus() {
+  const boards = {};
+  for (const [bid, log] of boardLogs.entries()) {
+    boards[bid] = {
+      logLength:   log.length,
+      commitIndex: _getCommitIndex(bid),
+    };
+  }
   return {
     id:          config.REPLICA_ID,
     state,
     term:        currentTerm,
     leader:      currentLeader,
-    logLength:   log.length,
-    commitIndex,
+    logLength:   _globalLastIndex(),
+    commitIndex: Math.max(0, ...[...boardCommitIndex.values()]),
+    boards,
   };
 }
 
@@ -703,4 +761,5 @@ module.exports = {
   handleAppendEntries,
   handleSyncLog,
   handleClientStroke,
+  getCommittedLog,
 };

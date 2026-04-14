@@ -1,106 +1,194 @@
 /**
- * app.js — Mini-RAFT Drawing Board Frontend
+ * app.js — Mini-RAFT Drawing Board Frontend  (Multi-Tenant Edition)
  *
- * Pipeline:
+ * Architecture:
+ *   Lobby Screen  →  user picks Create / Join / Free-Draw
+ *   Board Screen  →  canvas + toolbar for a specific boardId
+ *
+ * Pipeline (unchanged from Week 2, now board-scoped):
  *   User draws  →  points collected on live canvas layer
- *   onPointerUp →  decimated points sent as { type:"stroke", data:{points,color,width} }
- *   Gateway     →  forwards to RAFT Leader via /client-stroke
- *   Leader      →  AppendEntries to majority → commit → POST /broadcast to Gateway
- *   Gateway     →  broadcasts { type:"stroke-committed", data:{index,points,color,width} }
- *   Frontend    →  receives stroke-committed, deduplicates, adds to committedStrokes, redraws
+ *   onPointerUp →  decimated points sent as { type:"stroke", boardId, data:{points,color,width} }
+ *   Gateway     →  forwards to RAFT Leader via POST /client-stroke (boardId in body)
+ *   Leader      →  AppendEntries to majority → commit → POST /broadcast { boardId, stroke }
+ *   Gateway     →  broadcastToBoard(boardId) → { type:"stroke-committed", boardId, data:{...} }
+ *   Frontend    →  receives stroke-committed (guards boardId), deduplicates, redraws
  *
- * Key design decisions:
- *  - Two logical layers: committedStrokes[] (RAFT-committed) + pendingStrokes[] (in-flight local)
- *    Both replayed on resize → no strokes vanish during replication round-trip
- *  - Stroke point decimation (3px threshold) cuts point count ~60–80% on fast strokes
- *  - On reconnect: pendingStrokes[] are CLEARED because the gateway may not have delivered
- *    them to the leader — the full-sync from the server is the authoritative canvas state
- *  - Eraser rendered with canvas background colour (#f8f8f8) for correct erase effect
- *  - visibilitychange + online events accelerate reconnection (no waiting up to 16 s)
- *  - Overlay uses opacity + pointer-events fade instead of display:none for smooth animation
+ * New in this edition:
+ *  - generateBoardId()   — 6-char alphanumeric Room ID (e.g. "Xk4f9P")
+ *  - currentBoardId      — boardId for this tab's session
+ *  - join-board handshake on WS open
+ *  - All stroke messages carry boardId
+ *  - full-sync and stroke-committed guarded by boardId match
+ *  - user-count message updates per-board badge
+ *  - Leave Room → return to lobby
  */
 
 'use strict';
 
-// ── DOM references ────────────────────────────────────────────────────────────
-const canvas        = document.getElementById('drawing-canvas');
-const ctx           = canvas.getContext('2d');
-const statusEl      = document.getElementById('status-indicator');
-const overlayEl     = document.getElementById('canvas-overlay');
-const overlayMsgEl  = document.getElementById('overlay-message');
-const overlaySubEl  = document.getElementById('overlay-sub');       // NEW
-const leaderNameEl  = document.getElementById('leader-name');
-const countValueEl  = document.getElementById('count-value');
-const queueDepthEl  = document.getElementById('queue-depth');
+// ════════════════════════════════════════════════════════════════════════════
+// LOBBY LOGIC
+// ════════════════════════════════════════════════════════════════════════════
+
+const lobbyScreen    = document.getElementById('lobby-screen');
+const boardScreen    = document.getElementById('board-screen');
+const generatedIdEl  = document.getElementById('generated-board-id');
+const btnRegenId     = document.getElementById('btn-regenerate-id');
+const btnCreateRoom  = document.getElementById('btn-create-room');
+const joinInput      = document.getElementById('join-board-input');
+const btnJoinRoom    = document.getElementById('btn-join-room');
+const joinError      = document.getElementById('join-error');
+const btnFreeDraw    = document.getElementById('btn-free-draw');
+const btnLeaveRoom   = document.getElementById('btn-leave-room');
+const roomIdDisplay  = document.getElementById('room-id-display');
+
+/** Current board this tab is connected to. null = not yet joined. */
+let currentBoardId = null;
+
+/** Generate a random 6-character alphanumeric Room ID. */
+function generateBoardId() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+  let id = '';
+  for (let i = 0; i < 6; i++) {
+    id += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return id;
+}
+
+/** Refresh the displayed generated Room ID. */
+function refreshGeneratedId() {
+  generatedIdEl.textContent = generateBoardId();
+}
+
+/** Show the lobby and disconnect from any current board. */
+function showLobby() {
+  boardScreen.classList.add('board-screen-hidden');
+  lobbyScreen.classList.remove('lobby-hidden');
+  currentBoardId = null;
+  // Intentionally close the WS on leave so the server cleans up the room
+  if (ws) {
+    isIntentionalClose = true;
+    ws.close();
+    isIntentionalClose = false;
+    ws = null;
+  }
+  stopPing();
+  committedStrokes.length = 0;
+  pendingStrokes.length   = 0;
+  refreshGeneratedId();
+}
+
+/** Enter the board screen for a given boardId. */
+function enterBoard(boardId) {
+  if (!boardId || !boardId.trim()) {
+    showJoinError('Please enter a valid Room ID.');
+    return;
+  }
+  currentBoardId = boardId.trim();
+  roomIdDisplay.textContent = currentBoardId;
+  hideJoinError();
+
+  lobbyScreen.classList.add('lobby-hidden');
+  boardScreen.classList.remove('board-screen-hidden');
+
+  // Boot canvas + WS for this board
+  resizeCanvas();
+  updateBrushPreview();
+  connect();
+  startHealthPolling();
+}
+
+function showJoinError(msg) {
+  joinError.textContent = msg;
+  joinError.removeAttribute('hidden');
+}
+function hideJoinError() {
+  joinError.textContent = '';
+  joinError.setAttribute('hidden', '');
+}
+
+// ── Lobby event handlers ──────────────────────────────────────────────────────
+
+btnRegenId.addEventListener('click', refreshGeneratedId);
+
+btnCreateRoom.addEventListener('click', () => {
+  enterBoard(generatedIdEl.textContent);
+});
+
+btnJoinRoom.addEventListener('click', () => {
+  const id = joinInput.value.trim();
+  if (!id) { showJoinError('Please enter a Room ID.'); return; }
+  enterBoard(id);
+});
+
+joinInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') btnJoinRoom.click();
+});
+
+btnFreeDraw.addEventListener('click', () => {
+  enterBoard('board-public');
+});
+
+btnLeaveRoom.addEventListener('click', showLobby);
+
+// Initialise the lobby with a fresh generated ID
+refreshGeneratedId();
+
+// ════════════════════════════════════════════════════════════════════════════
+// CANVAS & DRAWING ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── DOM references ─────────────────────────────────────────────────────────
+const canvas         = document.getElementById('drawing-canvas');
+const ctx            = canvas.getContext('2d');
+const statusEl       = document.getElementById('status-indicator');
+const overlayEl      = document.getElementById('canvas-overlay');
+const overlayMsgEl   = document.getElementById('overlay-message');
+const overlaySubEl   = document.getElementById('overlay-sub');
+const leaderNameEl   = document.getElementById('leader-name');
+const countValueEl   = document.getElementById('count-value');
+const queueDepthEl   = document.getElementById('queue-depth');
 const toastContainer = document.getElementById('toast-container');
 const brushSizeInput = document.getElementById('brush-size');
 const brushPreviewEl = document.getElementById('brush-preview');
-const btnClear      = document.getElementById('btn-clear');
-const colourBtns    = document.querySelectorAll('.colour-btn');
+const btnClear       = document.getElementById('btn-clear');
+const colourBtns     = document.querySelectorAll('.colour-btn');
 
-// ── Canvas background colour (must match CSS #canvas-container background) ───
+// ── Canvas background colour ──────────────────────────────────────────────
 const CANVAS_BG = '#f8f8f8';
 
-// ── Drawing state ─────────────────────────────────────────────────────────────
+// ── Drawing state ─────────────────────────────────────────────────────────
 let isDrawing         = false;
 let currentColor      = '#1e1e2e';
 let brushSize         = 4;
 let isEraser          = false;
-let currentStrokePoints = [];   // Deprecated: replaced by emittedAnySegment
-let emittedAnySegment = false;  // Track if any segment was sent during gesture
-let lastEmittedPoint  = null;   // Last recorded point — used for decimation
+let emittedAnySegment = false;
+let lastEmittedPoint  = null;
 
-// ── Point decimation threshold ────────────────────────────────────────────────
-// Skip a new point if it is closer than this to the last recorded one.
-// 3 CSS px is imperceptible visually but cuts point count by ~60–80%.
+// ── Point decimation ──────────────────────────────────────────────────────
 const MIN_POINT_DISTANCE_PX = 3;
 
-// ── Stroke stores ─────────────────────────────────────────────────────────────
-/**
- * Committed strokes received from the RAFT cluster (authoritative, survive resize).
- * Each entry: { index, points, color, width }
- */
+// ── Stroke stores ─────────────────────────────────────────────────────────
+/** Committed strokes from the RAFT cluster (authoritative). */
 const committedStrokes = [];
-
-/**
- * Locally-drawn strokes awaiting commit acknowledgment from the server.
- * IMPORTANT: these are cleared on every reconnect because the gateway may not
- * have forwarded them to the leader before the connection dropped.
- * The authoritative canvas state always comes from the full-sync on reconnect.
- */
-const pendingStrokes = [];
-
-/** Monotonic counter for client-local stroke IDs. */
+/** Locally-drawn strokes awaiting ack — cleared on reconnect. */
+const pendingStrokes   = [];
 let nextTempId = 1;
 
-// ── Reconnection state ────────────────────────────────────────────────────────
+// ── Reconnection state ────────────────────────────────────────────────────
 const GATEWAY_WS_URL  = `ws://${location.hostname}:3000`;
 let ws                = null;
 let reconnectTimer    = null;
-let reconnectDelay    = 500;        // ms — doubles on each failure (exponential backoff)
+let reconnectDelay    = 500;
 const RECONNECT_MIN   = 500;
-const RECONNECT_MAX   = 16_000;    // cap at 16 s
-let reconnectCount    = 0;          // counts consecutive failures (0 = first connect)
-let isIntentionalClose = false;     // set before ws.close() to suppress reconnect
+const RECONNECT_MAX   = 16_000;
+let reconnectCount    = 0;
+let isIntentionalClose = false;
 
-// ── Received index tracking (dedup during reconnect window) ──────────────────
-/**
- * Highest committed index we've seen so far.
- * If a broadcast arrives BEFORE the full-sync completes (e.g. during the brief
- * window between WS open and receiving full-sync), we buffer it here so we can
- * merge correctly once full-sync arrives.
- */
-let pendingBroadcasts = []; // strokes received before first full-sync on this conn
+/** Pre-sync buffer: stroke-committed messages arriving before full-sync. */
+let pendingBroadcasts = [];
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CANVAS UTILITIES
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Canvas utilities ──────────────────────────────────────────────────────
 
-/**
- * Resize the canvas backing buffer to match its CSS display size.
- * Called on init and on every window resize. Re-renders all strokes because
- * changing canvas dimensions clears the context.
- */
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
   canvas.width  = Math.floor(rect.width  * window.devicePixelRatio);
@@ -109,24 +197,19 @@ function resizeCanvas() {
   redrawAll();
 }
 
-window.addEventListener('resize', resizeCanvas);
+window.addEventListener('resize', () => {
+  if (currentBoardId) resizeCanvas();
+});
 
-/**
- * Render a single stroke onto the canvas.
- * @param {{ points: {x,y}[], color: string, width: number }} stroke
- * @param {number} [alpha=1]  Opacity — 0.45 for pending strokes
- */
 function renderStroke(stroke, alpha = 1) {
   if (!stroke.points || stroke.points.length < 2) return;
-
   ctx.save();
-  ctx.globalAlpha    = alpha;
+  ctx.globalAlpha = alpha;
   ctx.beginPath();
-  ctx.lineCap        = 'round';
-  ctx.lineJoin       = 'round';
-  ctx.strokeStyle    = stroke.color === 'eraser' ? CANVAS_BG : stroke.color;
-  ctx.lineWidth      = stroke.width;
-
+  ctx.lineCap     = 'round';
+  ctx.lineJoin    = 'round';
+  ctx.strokeStyle = stroke.color === 'eraser' ? CANVAS_BG : stroke.color;
+  ctx.lineWidth   = stroke.width;
   const [first, ...rest] = stroke.points;
   ctx.moveTo(first.x, first.y);
   for (const pt of rest) ctx.lineTo(pt.x, pt.y);
@@ -134,31 +217,22 @@ function renderStroke(stroke, alpha = 1) {
   ctx.restore();
 }
 
-/**
- * Re-render all committed strokes then all pending strokes.
- * Called after resize or full-sync.
- */
 function redrawAll() {
   const cssW = canvas.width  / window.devicePixelRatio;
   const cssH = canvas.height / window.devicePixelRatio;
   ctx.clearRect(0, 0, cssW, cssH);
-
   for (const stroke of committedStrokes) renderStroke(stroke);
   for (const stroke of pendingStrokes)   renderStroke(stroke, 0.45);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// POINTER (MOUSE + TOUCH) EVENT HANDLERS
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Pointer events ────────────────────────────────────────────────────────
 
-/** Convert a mouse or touch event to canvas-relative CSS coordinates. */
 function eventToPoint(e) {
   const rect = canvas.getBoundingClientRect();
   const src  = e.touches ? e.touches[0] : e;
   return { x: src.clientX - rect.left, y: src.clientY - rect.top };
 }
 
-/** Squared distance between two points (avoids Math.sqrt). */
 function dist2(a, b) {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
@@ -169,13 +243,12 @@ function onPointerDown(e) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   e.preventDefault();
   isDrawing = true;
-  emittedAnySegment   = false;
-  lastEmittedPoint    = null;
+  emittedAnySegment = false;
+  lastEmittedPoint  = null;
 
   const pt = eventToPoint(e);
   lastEmittedPoint = pt;
 
-  // Begin live path on canvas immediately for responsive feel
   ctx.save();
   ctx.beginPath();
   ctx.lineCap    = 'round';
@@ -190,8 +263,6 @@ function onPointerMove(e) {
   e.preventDefault();
 
   const pt = eventToPoint(e);
-
-  // ── Point decimation ─────────────────────────────────────────────────────
   const threshold2 = MIN_POINT_DISTANCE_PX * MIN_POINT_DISTANCE_PX;
   if (lastEmittedPoint && dist2(pt, lastEmittedPoint) < threshold2) return;
 
@@ -202,17 +273,16 @@ function onPointerMove(e) {
   };
 
   if (ws && ws.readyState === WebSocket.OPEN) {
-    const tempId  = nextTempId++;
+    const tempId = nextTempId++;
     pendingStrokes.push({ tempId, ...strokeData });
     sendStroke(strokeData);
     emittedAnySegment = true;
   }
 
   lastEmittedPoint = pt;
-
   ctx.lineTo(pt.x, pt.y);
   ctx.stroke();
-  ctx.beginPath(); // Re-open to avoid accumulation
+  ctx.beginPath();
   ctx.moveTo(pt.x, pt.y);
 }
 
@@ -222,63 +292,45 @@ function onPointerUp(e) {
   ctx.restore();
   isDrawing = false;
 
-  // Handle single click or very small movements that didn't trigger decimation threshold
   if (!emittedAnySegment && lastEmittedPoint) {
     const strokeData = {
       points: [lastEmittedPoint, { x: lastEmittedPoint.x + 0.5, y: lastEmittedPoint.y + 0.5 }],
       color:  isEraser ? 'eraser' : currentColor,
       width:  brushSize,
     };
-
-    // [BUG-8 FIX] Only add to pendingStrokes if the WS is actually open.
-    // If the socket is connecting/closed, sendStroke will be a no-op anyway,
-    // but without this guard the stroke would accumulate as a ghost pending
-    // entry that never gets resolved (no commit ACK arrives for undelivered strokes).
     if (ws && ws.readyState === WebSocket.OPEN) {
-      const tempId  = nextTempId++;
+      const tempId = nextTempId++;
       pendingStrokes.push({ tempId, ...strokeData });
       sendStroke(strokeData);
-    } else {
-      console.debug('[WS] Stroke drawn while socket not open — discarding (not added to pending)');
     }
   }
 
   lastEmittedPoint = null;
 }
 
-// Mouse events
 canvas.addEventListener('mousedown',  onPointerDown);
 canvas.addEventListener('mousemove',  onPointerMove);
 canvas.addEventListener('mouseup',    onPointerUp);
 canvas.addEventListener('mouseleave', onPointerUp);
-
-// Touch events
 canvas.addEventListener('touchstart', onPointerDown, { passive: false });
 canvas.addEventListener('touchmove',  onPointerMove, { passive: false });
 canvas.addEventListener('touchend',   onPointerUp,   { passive: false });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// WEBSOCKET CLIENT — RECONNECTION WITH FULL-SYNC
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// WEBSOCKET CLIENT
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
- * Open a WebSocket connection to the Gateway.
+ * Open a WebSocket connection to the Gateway and join the current board room.
  *
- * Reconnection behaviour (FR-FE-09 / FR-FE-10):
- *  1. On open → hide overlay, reset delay, wait for full-sync
- *  2. On full-sync → clear committedStrokes, rebuild from server state, redraw
- *     → also clear pendingStrokes (they were lost on disconnect; server is authoritative)
- *     → drain any broadcasts buffered before full-sync arrived
- *  3. On close/error → show overlay with attempt counter, schedule retry
- *     → exponential backoff: 500 → 1000 → 2000 → 4000 → 8000 → 16000 → 16000…
- *  4. visibilitychange / online events → trigger immediate reconnect
- *     (avoids user waiting up to 16 s when they switch back to the tab)
- *
- * Canvas guarantee: after every reconnect the canvas exactly matches
- * the RAFT cluster's committed log — zero missing strokes, zero duplicates.
+ * On open:   send { type:"join-board", boardId } to register in the board room.
+ *            Gateway responds with full-sync for that board.
+ * On message: route to handleMessage().
+ * On close:   exponential backoff reconnect; re-join same boardId on next open.
  */
 function connect() {
-  // Clean up any previous socket
+  if (!currentBoardId) return; // Don't connect until a board has been chosen
+
   if (ws) {
     isIntentionalClose = true;
     ws.close();
@@ -295,35 +347,33 @@ function connect() {
     isReconnect ? 'Canvas will restore automatically' : ''
   );
 
-  // Each new connection starts fresh: any broadcasts received before full-sync
-  // is confirmed will be buffered here and merged in afterwards.
   pendingBroadcasts = [];
   let fullSyncReceived = false;
 
   ws = new WebSocket(GATEWAY_WS_URL);
 
-  // ── Open ───────────────────────────────────────────────────────────────────
   ws.addEventListener('open', () => {
     reconnectDelay = RECONNECT_MIN;
-    console.log(`[WS] ${isReconnect ? 'Reconnected' : 'Connected'} to Gateway`);
-    // Status stays 'reconnecting' (spinner) until full-sync arrives
+    console.log(`[WS] ${isReconnect ? 'Reconnected' : 'Connected'} — joining board "${currentBoardId}"`);
+    // ── join-board handshake ──────────────────────────────────────────────
+    ws.send(JSON.stringify({ type: 'join-board', boardId: currentBoardId }));
     startPing();
   });
 
-  // ── Messages ───────────────────────────────────────────────────────────────
   ws.addEventListener('message', (event) => {
     let msg;
     try { msg = JSON.parse(event.data); }
     catch { console.warn('[WS] Non-JSON message:', event.data); return; }
 
-    // Buffer stroke-committed messages that arrive BEFORE full-sync
-    // (can happen in the brief window between open and receiving full-sync)
+    // Guard: board-specific messages must match our board
+    if (msg.boardId && msg.boardId !== currentBoardId) return;
+
+    // Buffer stroke-committed messages arriving before full-sync
     if (msg.type === 'stroke-committed' && !fullSyncReceived) {
       pendingBroadcasts.push(msg.data);
       return;
     }
 
-    // Once we know full-sync status, route all messages normally
     if (msg.type === 'full-sync') {
       fullSyncReceived = true;
     }
@@ -331,11 +381,9 @@ function connect() {
     handleMessage(msg);
   });
 
-  // ── Close ──────────────────────────────────────────────────────────────────
   ws.addEventListener('close', (event) => {
     stopPing();
-
-    if (isIntentionalClose) return; // We closed it ourselves — skip reconnect
+    if (isIntentionalClose) return;
 
     reconnectCount++;
     const delay = reconnectDelay;
@@ -352,19 +400,15 @@ function connect() {
       showToast('Connection lost — reconnecting…', 'warn', 4000);
     }
 
-    // [OBS-5] Polish: show delay + attempt counter clearly for debugging
     console.log(
-      `[WS] Closed (code=${event.code}). Retry #${reconnectCount} in ${delay}ms` +
-      ` (next cap: ${reconnectDelay}ms)`
+      `[WS] Closed (code=${event.code}). Retry #${reconnectCount} in ${delay}ms`
     );
 
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connect, delay);
   });
 
-  // ── Error ──────────────────────────────────────────────────────────────────
   ws.addEventListener('error', () => {
-    // close event fires immediately after error — reconnect logic is there
     console.error('[WS] Socket error — waiting for close event to reconnect');
   });
 }
@@ -373,32 +417,16 @@ function connect() {
 function handleMessage(msg) {
   switch (msg.type) {
 
-    // ── FULL-SYNC: complete canvas restore on (re)connect ──────────────────
     case 'full-sync': {
-      /**
-       * Full canvas restore protocol (FR-FE-10):
-       *
-       * 1.  Replace committedStrokes[] with the authoritative server state.
-       * 2.  CLEAR pendingStrokes[] — these were sent to the old (dead) socket;
-       *     the server has no record of them. Keeping them would show ghost
-       *     strokes that the cluster may never commit.
-       * 3.  Merge any stroke-committed broadcasts that arrived before this
-       *     full-sync (the brief window between open and full-sync).
-       *     Only merge indices not already in the full-sync payload.
-       * 4.  Redraw the canvas.
-       * 5.  Update UI: hide overlay, show connected, optional toast.
-       */
       const strokes = msg.data?.strokes || [];
 
-      // 1. Replace committed strokes
       committedStrokes.length = 0;
       committedStrokes.push(...strokes);
 
-      // 2. Clear stale pending strokes — server state is authoritative
       const hadPending = pendingStrokes.length;
       pendingStrokes.length = 0;
 
-      // 3. Drain buffered pre-sync broadcasts (idempotent merge)
+      // Drain buffered pre-sync broadcasts
       const committedSet = new Set(committedStrokes.map(s => s.index));
       for (const stroke of pendingBroadcasts) {
         if (!committedSet.has(stroke.index)) {
@@ -406,27 +434,23 @@ function handleMessage(msg) {
           committedSet.add(stroke.index);
         }
       }
-      // Sort so canvas renders in commit order
       committedStrokes.sort((a, b) => a.index - b.index);
       pendingBroadcasts = [];
 
-      // 4. Redraw
       redrawAll();
-
-      // 5. UI update
       hideOverlay();
       setStatus('connected', 'Connected');
 
       const isReconnect = reconnectCount > 0;
-      reconnectCount = 0; // Reset after successful sync
+      reconnectCount = 0;
 
       console.log(
-        `[WS] Full-sync: ${strokes.length} stroke(s)` +
+        `[WS] Full-sync (board=${currentBoardId}): ${strokes.length} stroke(s)` +
         (isReconnect ? ' (reconnected — canvas restored)' : '')
       );
 
       if (hadPending > 0) {
-        showToast(`${hadPending} in-flight stroke(s) may not have been committed — canvas re-synced from server`, 'warn', 5000);
+        showToast(`${hadPending} in-flight stroke(s) may not have been committed — canvas re-synced`, 'warn', 5000);
       } else if (strokes.length > 0) {
         showToast(
           isReconnect
@@ -436,55 +460,40 @@ function handleMessage(msg) {
           3000
         );
       } else if (isReconnect) {
-        showToast('Reconnected — canvas is empty (nothing drawn yet)', 'info', 2500);
+        showToast('Reconnected — board is empty (nothing drawn yet)', 'info', 2500);
       }
-
       break;
     }
 
-    // ── STROKE-COMMITTED: incremental update ───────────────────────────────
     case 'stroke-committed': {
-      /**
-       * A stroke has been committed by the RAFT cluster.
-       *
-       * Deduplication:
-       *  - If index already in committedStrokes[] → skip (idempotent on reconnect)
-       *  - The oldest pending stroke (FIFO) is consumed when a commit arrives,
-       *    because it's the stroke we drew locally. This removes the faded
-       *    placeholder and replaces it with the authoritative committed copy.
-       *  - If no pending → it's another user's stroke, just append and render.
-       */
       const stroke = msg.data;
-
       if (committedStrokes.some(s => s.index === stroke.index)) break;
-
-      if (pendingStrokes.length > 0) {
-        pendingStrokes.shift(); // Consume the local faded placeholder (FIFO)
-      }
-
+      if (pendingStrokes.length > 0) pendingStrokes.shift();
       committedStrokes.push(stroke);
-      redrawAll(); // Re-layer so pending correctly stacks above committed
+      redrawAll();
       break;
     }
 
-    // ── PONG: keep-alive reply ─────────────────────────────────────────────
+    // ── Per-board user count ──────────────────────────────────────────────
+    case 'user-count': {
+      if (countValueEl) countValueEl.textContent = msg.count ?? '–';
+      break;
+    }
+
     case 'pong':
       break;
 
-    // ── ERROR: server validation error ────────────────────────────────────
     case 'error':
       console.warn('[WS] Server error:', msg.data?.message);
       showToast(msg.data?.message || 'Server error', 'error');
       break;
 
-    // ── LEADER-CHANGING: failover started (no WS disconnect) ──────────────
     case 'leader-changing':
       console.warn('[WS] Leader changing — election in progress');
       setFailoverIndicator(true);
       showToast('Leader election in progress — strokes are safely queued ⏳', 'warn', 5000);
       break;
 
-    // ── LEADER-RESTORED: new leader elected, queue drained ────────────────
     case 'leader-restored':
       console.log('[WS] Leader restored:', msg.data?.leader);
       setFailoverIndicator(false);
@@ -497,18 +506,17 @@ function handleMessage(msg) {
   }
 }
 
-/** Send a stroke to the Gateway. */
+/** Send a stroke to the Gateway, tagged with the current boardId. */
 function sendStroke(strokeData) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: 'stroke', data: strokeData }));
-  console.log(`[WS] Sent stroke — ${strokeData.points.length} point(s)`);
+  ws.send(JSON.stringify({ type: 'stroke', boardId: currentBoardId, data: strokeData }));
 }
 
 // ── Keep-alive ping ───────────────────────────────────────────────────────────
 let pingInterval = null;
 
 function startPing() {
-  stopPing(); // Ensure no duplicate interval
+  stopPing();
   pingInterval = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'ping' }));
@@ -521,49 +529,36 @@ function stopPing() {
   pingInterval = null;
 }
 
-// ── Fast reconnect on visibility / network restore ─────────────────────────
-/**
- * When the browser tab becomes visible again or the network comes back online,
- * check if the socket is in a bad state and reconnect immediately rather than
- * waiting for the full exponential backoff to fire.
- *
- * This is critical for the scenario: user switches away for 30 s → tab goes
- * idle → socket dies → user switches back → canvas should restore in <1 s.
- */
+// ── Fast reconnect on visibility / network restore ────────────────────────────
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
+  if (document.visibilityState === 'visible' && currentBoardId) {
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       console.log('[WS] Tab became visible with dead socket — reconnecting immediately');
       clearTimeout(reconnectTimer);
-      reconnectDelay = RECONNECT_MIN; // Reset backoff for user-initiated context switch
+      reconnectDelay = RECONNECT_MIN;
       connect();
     }
   }
 });
 
 window.addEventListener('online', () => {
-  console.log('[WS] Network came online — reconnecting immediately');
-  clearTimeout(reconnectTimer);
-  reconnectDelay = RECONNECT_MIN;
-  connect();
+  if (currentBoardId) {
+    console.log('[WS] Network came online — reconnecting immediately');
+    clearTimeout(reconnectTimer);
+    reconnectDelay = RECONNECT_MIN;
+    connect();
+  }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 // UI HELPERS
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 
 function setStatus(cssClass, text) {
   statusEl.className   = `status ${cssClass}`;
   statusEl.textContent = text;
 }
 
-/**
- * Show or hide the failover indicator.
- *
- * isActive=true  → pulsing yellow "Electing…" pill (no canvas overlay —
- *                  canvas stays usable, strokes are queued gateway-side)
- * isActive=false → restore "Connected" pill
- */
 function setFailoverIndicator(isActive) {
   if (isActive) {
     setStatus('reconnecting', 'Electing…');
@@ -581,10 +576,6 @@ function setFailoverIndicator(isActive) {
   }
 }
 
-/**
- * Show the canvas overlay with a primary message and optional subtitle.
- * Uses opacity+pointer-events instead of display:none so the CSS fade plays.
- */
 function showOverlay(message, sub = '') {
   overlayMsgEl.textContent = message;
   if (overlaySubEl) overlaySubEl.textContent = sub;
@@ -592,20 +583,11 @@ function showOverlay(message, sub = '') {
   overlayEl.removeAttribute('aria-hidden');
 }
 
-/**
- * Hide the canvas overlay with a smooth fade.
- */
 function hideOverlay() {
   overlayEl.classList.add('overlay-hidden');
   overlayEl.setAttribute('aria-hidden', 'true');
 }
 
-/**
- * Show a toast notification.
- * @param {string} message
- * @param {'info'|'success'|'warn'|'error'} type
- * @param {number} duration  ms before auto-dismiss
- */
 function showToast(message, type = 'info', duration = 3500) {
   const toast = document.createElement('div');
   toast.className   = `toast toast-${type}`;
@@ -614,7 +596,6 @@ function showToast(message, type = 'info', duration = 3500) {
   setTimeout(() => toast.remove(), duration);
 }
 
-/** Update the leader badge. Accepts "http://replica1:4001" → shows "replica1". */
 function updateLeaderBadge(leaderUrl) {
   if (!leaderUrl) { leaderNameEl.textContent = '–'; return; }
   try {
@@ -634,26 +615,23 @@ function updateBrushPreview() {
   brushPreviewEl.style.border     = isEraser ? '1.5px dashed #666' : 'none';
 }
 
-// ── Poll Gateway /health for leader info + queue depth ────────────────────────
+// ── Poll Gateway /health for leader info + queue depth ─────────────────────────
+let healthPollTimer = null;
+
 function startHealthPolling() {
+  if (healthPollTimer) return; // Already running
   const HEALTH_URL = `http://${location.hostname}:3000/health`;
 
-  setInterval(async () => {
+  healthPollTimer = setInterval(async () => {
+    if (!currentBoardId) return;
     try {
       const res  = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(2000) });
       const data = await res.json();
 
-      // Update leader badge (unless failover is in progress — badge will be
-      // updated from the leader-restored WS message instead)
       if (!data.failoverActive) {
         updateLeaderBadge(data.leader);
       }
 
-      if (data.clients !== undefined) {
-        countValueEl.textContent = data.clients;
-      }
-
-      // Sync failover indicator in case we missed the WS push
       if (data.failoverActive) {
         setFailoverIndicator(true);
       } else if (statusEl.classList.contains('reconnecting') && ws && ws.readyState === WebSocket.OPEN) {
@@ -661,7 +639,6 @@ function startHealthPolling() {
         updateLeaderBadge(data.leader);
       }
 
-      // Queue depth badge — hidden when queue is empty
       if (queueDepthEl) {
         const depth = data.queueDepth ?? 0;
         if (depth > 0) {
@@ -672,19 +649,15 @@ function startHealthPolling() {
         }
       }
     } catch (err) {
-      // [BUG-10 FIX] Gateway unreachable — log at debug level so dev tools
-      // show gateway restarts without flooding the console during normal operation.
       console.debug(`[Health] Gateway poll failed: ${err.message}`);
-      // WS reconnection handles recovery — no action needed here
     }
   }, 3000);
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 // TOOLBAR WIRE-UP
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 
-// Colour buttons
 colourBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     const colour = btn.dataset.colour;
@@ -700,13 +673,11 @@ colourBtns.forEach((btn) => {
   });
 });
 
-// Brush size slider
 brushSizeInput.addEventListener('input', () => {
   brushSize = parseInt(brushSizeInput.value, 10);
   updateBrushPreview();
 });
 
-// Clear button — local canvas only
 btnClear.addEventListener('click', () => {
   committedStrokes.length = 0;
   pendingStrokes.length   = 0;
@@ -716,20 +687,11 @@ btnClear.addEventListener('click', () => {
   showToast('Canvas cleared locally', 'info', 2000);
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// INIT
-// ══════════════════════════════════════════════════════════════════════════════
+console.log('[Frontend] Mini-RAFT Drawing Board (multi-tenant) initialised');
 
-resizeCanvas();       // Set correct pixel dimensions + scale immediately
-updateBrushPreview(); // Sync brush preview with initial values
-connect();            // Open WebSocket to Gateway (triggers full-sync)
-startHealthPolling(); // Poll /health every 3 s for leader info + queue depth
-
-console.log('[Frontend] Mini-RAFT Drawing Board initialised');
-
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 // EXPORT  (PNG + PDF)
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 
 const exportGroup    = document.getElementById('export-group');
 const exportBtn      = document.getElementById('btn-export');
@@ -763,14 +725,12 @@ exportBtn.addEventListener('click', (e) => {
   }
 });
 
-// Close dropdown when clicking outside
 document.addEventListener('click', (e) => {
   if (!exportGroup.contains(e.target)) {
     closeExportDropdown();
   }
 });
 
-// Close on Escape
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeExportDropdown();
 });
@@ -787,27 +747,18 @@ function hideExportModal() {
 }
 
 // ── Snapshot helper ────────────────────────────────────────────────────────
-/**
- * Returns a promise that resolves with a Blob of the current board as PNG.
- *
- * Strategy: draw the board onto an off-screen canvas with an explicit white
- * background so the exported image never has a transparent or dark background,
- * regardless of what the live canvas holds.
- */
+
 function getBoardBlob() {
   return new Promise((resolve, reject) => {
-    // Off-screen canvas at the same physical pixel size
     const offscreen = document.createElement('canvas');
     offscreen.width  = canvas.width;
     offscreen.height = canvas.height;
 
     const octx = offscreen.getContext('2d');
 
-    // 1. White background
     octx.fillStyle = CANVAS_BG;
     octx.fillRect(0, 0, offscreen.width, offscreen.height);
 
-    // 2. Copy committed strokes (re-render at full resolution)
     octx.save();
     octx.scale(window.devicePixelRatio, window.devicePixelRatio);
     for (const stroke of committedStrokes) {
@@ -849,16 +800,12 @@ async function exportPNG() {
     const anchor  = document.createElement('a');
     const ts      = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     anchor.href     = url;
-    anchor.download = `mini-raft-board-${ts}.png`;
+    anchor.download = `mini-raft-board-${currentBoardId}-${ts}.png`;
     document.body.appendChild(anchor);
     anchor.click();
     document.body.removeChild(anchor);
-
-    // Revoke the object URL after a short delay so the download has time to start
     setTimeout(() => URL.revokeObjectURL(url), 2000);
-
     showToast('PNG downloaded ✅', 'success', 3000);
-    console.log('[Export] PNG saved');
   } catch (err) {
     console.error('[Export] PNG failed:', err);
     showToast('PNG export failed — see console for details', 'error');
@@ -867,16 +814,8 @@ async function exportPNG() {
   }
 }
 
-// ── PDF export (print-window strategy) ─────────────────────────────────────
-/**
- * Opens a hidden window containing just the board image and calls window.print()
- * on it, which lets the browser render a clean PDF with system print-to-PDF.
- *
- * Advantages over jsPDF:
- *  - Zero third-party dependencies
- *  - Exact pixel-perfect rendering at any resolution
- *  - Browser handles page size / DPI negotiation natively
- */
+// ── PDF export ─────────────────────────────────────────────────────────────
+
 async function exportPDF() {
   closeExportDropdown();
 
@@ -891,12 +830,7 @@ async function exportPDF() {
     const blob    = await getBoardBlob();
     const dataUrl = await blobToDataURL(blob);
 
-    // Determine aspect ratio for the print page
-    const cssW    = canvas.width  / window.devicePixelRatio;
-    const cssH    = canvas.height / window.devicePixelRatio;
-    const ratio   = cssH / cssW;
-
-    const ts      = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
 
     const printWin = window.open('', '_blank', 'width=800,height=600');
     if (!printWin) {
@@ -908,7 +842,7 @@ async function exportPDF() {
 <html>
 <head>
   <meta charset="UTF-8"/>
-  <title>Mini-RAFT Board — ${ts}</title>
+  <title>Mini-RAFT Board ${currentBoardId} — ${ts}</title>
   <style>
     @page { margin: 0; size: auto; }
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -935,17 +869,14 @@ async function exportPDF() {
     printWin.document.close();
 
     showToast('PDF print dialog opened 🖨️ — save as PDF', 'success', 5000);
-    console.log('[Export] PDF print window opened');
   } catch (err) {
     console.error('[Export] PDF failed:', err);
     showToast('PDF export failed — see console for details', 'error');
   } finally {
-    // Hide the modal after a moment so it doesn't cover the print dialog
     setTimeout(hideExportModal, 600);
   }
 }
 
-/** Convert a Blob to a base-64 data URL (needed for the print window). */
 function blobToDataURL(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -954,8 +885,6 @@ function blobToDataURL(blob) {
     reader.readAsDataURL(blob);
   });
 }
-
-// ── Wire up export buttons ─────────────────────────────────────────────────
 
 exportPngBtn.addEventListener('click', exportPNG);
 exportPdfBtn.addEventListener('click', exportPDF);
