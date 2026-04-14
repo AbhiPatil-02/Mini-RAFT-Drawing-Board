@@ -40,6 +40,12 @@ const http          = require('http');
 const { WebSocketServer, OPEN } = require('ws');
 const leaderTracker = require('./leaderTracker');
 
+// ── Structured logger ─────────────────────────────────────────────────────────
+const _ts    = () => new Date().toISOString();
+const ginfo  = (msg) => console.log(`${_ts()} [INFO ][Gateway] ${msg}`);
+const gwarn  = (msg) => console.warn(`${_ts()} [WARN ][Gateway] ${msg}`);
+const gerror = (msg) => console.error(`${_ts()} [ERROR][Gateway] ${msg}`);
+
 // ── Express + HTTP + WebSocket setup ──────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
@@ -106,8 +112,8 @@ async function sendFullSync(ws) {
     if (!leaderUrl) {
       if (attempt < FULL_SYNC_RETRY_ATTEMPTS) {
         // Still in failover — wait for the tracker to find a new leader
-        console.log(
-          `[Gateway] Full-sync attempt ${attempt}: no leader yet — ` +
+        gwarn(
+          `Full-sync attempt ${attempt} for client #${ws.id}: no leader yet — ` +
           `waiting ${FULL_SYNC_RETRY_WAIT_MS}ms for failover to resolve`
         );
         await new Promise(r => setTimeout(r, FULL_SYNC_RETRY_WAIT_MS));
@@ -115,7 +121,7 @@ async function sendFullSync(ws) {
       }
       // Final attempt, still no leader — send empty sync
       sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-      console.log(`[Gateway] Full-sync: no leader — sent empty sync to client ${ws.id}`);
+      gwarn(`Full-sync: no leader — sent empty sync to client #${ws.id}`);
       return;
     }
 
@@ -123,15 +129,14 @@ async function sendFullSync(ws) {
       const logRes  = await axios.get(`${leaderUrl}/committed-log`, { timeout: 2000 });
       const strokes = logRes.data.strokes || [];
       sendToClient(ws, { type: 'full-sync', data: { strokes } });
-      console.log(
-        `[Gateway] Full-sync → client ${ws.id}: ${strokes.length} stroke(s) from ${leaderUrl}` +
-        (attempt > 1 ? ` (after ${attempt} attempts)` : '')
+      // [OBS-6] Normalized: always includes clientId, strokeCount, leaderUrl, attempt
+      ginfo(
+        `Full-sync → client #${ws.id}: ${strokes.length} stroke(s) from ${leaderUrl}` +
+        (attempt > 1 ? ` (attempt ${attempt})` : '')
       );
       return; // Success
     } catch (err) {
-      console.warn(
-        `[Gateway] Full-sync attempt ${attempt} failed for client ${ws.id}: ${err.message}`
-      );
+      gwarn(`Full-sync attempt ${attempt} failed for client #${ws.id}: ${err.message}`);
       if (attempt < FULL_SYNC_RETRY_ATTEMPTS) {
         // Leader became unreachable — wait for tracker to re-discover
         await new Promise(r => setTimeout(r, FULL_SYNC_RETRY_WAIT_MS));
@@ -141,16 +146,16 @@ async function sendFullSync(ws) {
 
   // All attempts failed — send empty sync so client can still draw
   sendToClient(ws, { type: 'full-sync', data: { strokes: [] } });
-  console.warn(`[Gateway] Full-sync: all ${FULL_SYNC_RETRY_ATTEMPTS} attempts failed for client ${ws.id} — sent empty sync`);
+  gwarn(`Full-sync: all ${FULL_SYNC_RETRY_ATTEMPTS} attempts failed for client #${ws.id} — sent empty sync`);
 }
 
-// ── WebSocket event handling ───────────────────────────────────────────────────
+// ── WebSocket event handling ────────────────────────────────────────────────
 wss.on('connection', (ws, req) => {
   ws.id = ++clientIdCounter;
   clients.add(ws);
 
   const clientIp = req.socket.remoteAddress || 'unknown';
-  console.log(`[Gateway] Client #${ws.id} connected from ${clientIp} — total: ${clients.size}`);
+  ginfo(`Client #${ws.id} connected from ${clientIp} — total: ${clients.size}`);
 
   // If a failover is in progress right now, tell this client immediately so
   // it can show a "leader changing" indicator in the UI while we do the full-sync
@@ -164,13 +169,13 @@ wss.on('connection', (ws, req) => {
   // Send full canvas state immediately on connect (FR-FE-10, FR-GW-05)
   sendFullSync(ws);
 
-  // ── Incoming messages from client ─────────────────────────────────────────
+  // ── Incoming messages from client ─────────────────────────────────────
   ws.on('message', (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw);
     } catch {
-      console.warn(`[Gateway] Client #${ws.id} sent invalid JSON — ignored`);
+      gwarn(`Client #${ws.id} sent invalid JSON — ignored`);
       sendToClient(ws, { type: 'error', data: { message: 'Invalid JSON' } });
       return;
     }
@@ -183,10 +188,10 @@ wss.on('connection', (ws, req) => {
           sendToClient(ws, { type: 'error', data: { message: 'Invalid stroke payload' } });
           return;
         }
-        console.log(`[Gateway] Client #${ws.id} sent stroke — forwarding to leader`);
+        ginfo(`Client #${ws.id} sent stroke — forwarding to leader`);
         // Forward to leader — leaderTracker handles queuing if no leader is known
         leaderTracker.forwardStroke(msg.data).catch((err) => {
-          console.error(`[Gateway] forwardStroke error: ${err.message}`);
+          gerror(`forwardStroke error: ${err.message}`);
         });
         break;
 
@@ -195,22 +200,24 @@ wss.on('connection', (ws, req) => {
         break;
 
       default:
-        console.warn(`[Gateway] Client #${ws.id} sent unknown message type: "${msg.type}"`);
+        gwarn(`Client #${ws.id} sent unknown message type: "${msg.type}"`);
     }
   });
 
-  // ── Connection closed ──────────────────────────────────────────────────────
+  // ── Connection closed ────────────────────────────────────────────
   ws.on('close', (code, reason) => {
     clients.delete(ws);
-    console.log(
-      `[Gateway] Client #${ws.id} disconnected` +
-      ` (code=${code}, reason=${reason || 'none'}) — remaining: ${clients.size}`
+    // [BUG-6 FIX] reason is a Buffer in the ws library — must .toString() for human-readable log
+    const reasonStr = reason && reason.length > 0 ? reason.toString() : 'none';
+    ginfo(
+      `Client #${ws.id} disconnected` +
+      ` (code=${code}, reason=${reasonStr}) — remaining: ${clients.size}`
     );
   });
 
-  // ── Connection error ───────────────────────────────────────────────────────
+  // ── Connection error ─────────────────────────────────────────────
   ws.on('error', (err) => {
-    console.error(`[Gateway] Client #${ws.id} error: ${err.message}`);
+    gerror(`Client #${ws.id} socket error: ${err.message}`);
     clients.delete(ws);
   });
 });
@@ -233,9 +240,7 @@ app.post('/broadcast', (req, res) => {
 
   const sent = broadcast({ type: 'stroke-committed', data: stroke });
 
-  console.log(
-    `[Gateway] /broadcast — index=${stroke.index} — pushed to ${sent}/${clients.size} client(s)`
-  );
+  ginfo(`/broadcast — index=${stroke.index} — pushed to ${sent}/${clients.size} client(s)`);
 
   res.json({ success: true, clientsNotified: sent });
 });
@@ -274,9 +279,9 @@ app.get('/status', (req, res) => {
 // Log every leader transition detected by the tracker
 leaderTracker.onLeaderChange((newLeader, prevLeader) => {
   if (newLeader) {
-    console.log(`[Gateway] Leader changed: ${prevLeader || 'none'} → ${newLeader}`);
+    ginfo(`Leader changed: ${prevLeader || 'none'} → ${newLeader}`);
   } else {
-    console.warn(`[Gateway] Leader lost (was ${prevLeader}) — strokes will be queued`);
+    gwarn(`Leader lost (was ${prevLeader}) — strokes will be queued`);
   }
 });
 
@@ -294,14 +299,14 @@ leaderTracker.onLeaderChange((newLeader, prevLeader) => {
  */
 leaderTracker.onFailoverStateChange((isActive) => {
   if (isActive) {
-    console.log('[Gateway] ⚡ Failover started — broadcasting leader-changing to all clients');
+    ginfo('⚡ Failover started — broadcasting leader-changing to all clients');
     broadcast({
       type: 'leader-changing',
       data: { message: 'Leader election in progress — your strokes are safely queued' },
     });
   } else {
     const newLeader = leaderTracker.getLeader();
-    console.log(`[Gateway] ✅ Failover complete — broadcasting leader-restored (${newLeader})`);
+    ginfo(`✅ Failover complete — broadcasting leader-restored (${newLeader})`);
     broadcast({
       type: 'leader-restored',
       data: { leader: newLeader },
@@ -310,9 +315,9 @@ leaderTracker.onFailoverStateChange((isActive) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`[Gateway] ── WebSocket Gateway starting ────────────────────────`);
-  console.log(`[Gateway]    HTTP + WS port : ${PORT}`);
-  console.log(`[Gateway]    Replicas       : ${process.env.REPLICAS || '(default)'}`);
-  console.log(`[Gateway] ────────────────────────────────────────────────────────`);
+  console.log(`${_ts()} [INFO ][Gateway] ── WebSocket Gateway starting ────────────────────`);
+  console.log(`${_ts()} [INFO ][Gateway]    HTTP + WS port : ${PORT}`);
+  console.log(`${_ts()} [INFO ][Gateway]    Replicas       : ${process.env.REPLICAS || '(default)'}`);
+  console.log(`${_ts()} [INFO ][Gateway] ────────────────────────────────────────────`);
   leaderTracker.start();
 });

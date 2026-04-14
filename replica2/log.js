@@ -10,6 +10,8 @@
  * RAFT Safety Rules:
  *  - Committed entries are NEVER overwritten (truncateFrom guards this)
  *  - Log index is 1-based
+ *
+ * [BUG-7 FIX] truncateFrom now emits a warning when called beyond log length.
  */
 
 class StrokeLog {
@@ -77,6 +79,16 @@ class StrokeLog {
 
     // Never truncate committed entries
     const safeStart = Math.max(startIndex, lastCommitted + 1);
+
+    // [BUG-7 FIX] Detect no-op truncations that would silently hide divergence bugs
+    if (safeStart > this.entries.length) {
+      console.warn(
+        `${new Date().toISOString()} [WARN ][LOG] truncateFrom(${startIndex}) is beyond` +
+        ` log length (${this.entries.length}) — no-op (safeStart=${safeStart})`
+      );
+      return;
+    }
+
     if (safeStart <= this.entries.length) {
       this.entries = this.entries.slice(0, safeStart - 1);
     }

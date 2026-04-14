@@ -5,6 +5,7 @@ networks:
 
 services:
 
+  # ── Frontend ──────────────────────────────────────────────────────────────
   frontend:
     build: ./frontend
     ports:
@@ -14,6 +15,7 @@ services:
     depends_on:
       - gateway
 
+  # ── Gateway ───────────────────────────────────────────────────────────────
   gateway:
     build: ./gateway
     ports:
@@ -27,10 +29,11 @@ services:
       - replica2
       - replica3
 
+  # ── Replica 1 ─────────────────────────────────────────────────────────────
   replica1:
     build: ./replica1
-    ports:
-      - "4001:4001"
+    expose:
+      - "4001"
     volumes:
       - ./replica1:/app          # Bind mount for hot-reload
       - /app/node_modules        # Preserve node_modules inside container
@@ -42,10 +45,11 @@ services:
     networks:
       - raft-net
 
+  # ── Replica 2 ─────────────────────────────────────────────────────────────
   replica2:
     build: ./replica2
-    ports:
-      - "4002:4002"
+    expose:
+      - "4002"
     volumes:
       - ./replica2:/app
       - /app/node_modules
@@ -57,10 +61,11 @@ services:
     networks:
       - raft-net
 
+  # ── Replica 3 ─────────────────────────────────────────────────────────────
   replica3:
     build: ./replica3
-    ports:
-      - "4003:4003"
+    expose:
+      - "4003"
     volumes:
       - ./replica3:/app
       - /app/node_modules

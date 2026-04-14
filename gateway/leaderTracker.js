@@ -28,15 +28,34 @@
  * Performance:
  *  - discoverLeader() polls all replicas in PARALLEL — leader found in one RTT
  *    regardless of replica ordering, not up-to-(worst RTT × N) as with sequential polling
+ *
+ * Fix log (audit):
+ *  [BUG-3] forwardStroke Case 1 (no leader) now uses _runFailoverRecovery instead of
+ *          fire-and-forget discoverLeader, preventing a double-discovery race when a
+ *          second stroke arrives while the .finally() lock-release is in-flight.
+ *  [OBS-3] Removed redundant per-poll "Leader: <url>" log line; the [NEW] marker on
+ *          leader change is sufficient and prevents log flooding.
  */
 
 'use strict';
 
 const axios = require('axios');
 
+// ── Structured logger ─────────────────────────────────────────────────────────
+const _ts  = () => new Date().toISOString();
+const linfo  = (msg) => console.log(`${_ts()} [INFO ][LeaderTracker] ${msg}`);
+const lwarn  = (msg) => console.warn(`${_ts()} [WARN ][LeaderTracker] ${msg}`);
+const lerror = (msg) => console.error(`${_ts()} [ERROR][LeaderTracker] ${msg}`);
+
 // ── Replica address list ──────────────────────────────────────────────────────
 // Parsed from REPLICAS env var: "replica1:4001,replica2:4002,replica3:4003"
-const REPLICAS = (process.env.REPLICAS || 'replica1:4001,replica2:4002,replica3:4003')
+// REPLICA_ENDPOINTS is accepted as a fallback for easier topology scaling.
+const replicaListCsv =
+  process.env.REPLICAS ||
+  process.env.REPLICA_ENDPOINTS ||
+  'replica1:4001,replica2:4002,replica3:4003';
+
+const REPLICAS = replicaListCsv
   .split(',')
   .map(r => `http://${r.trim()}`);
 
@@ -130,7 +149,11 @@ async function discoverLeader() {
   if (discoverInFlight) return; // Guard against concurrent invocations
   discoverInFlight = true;
 
-  console.log('[LeaderTracker] Discovering leader (parallel poll)...');
+  // [OBS-3] Only log on first discovery attempt, not on every routine poll cycle.
+  // The [NEW] tag in _setLeader already logs every leader change unambiguously.
+  if (!currentLeader) {
+    linfo('Discovering leader (parallel poll)...');
+  }
 
   try {
     // Promise.any resolves with the FIRST fulfilled value (first Leader found).
@@ -139,16 +162,15 @@ async function discoverLeader() {
 
     const changed = (found !== currentLeader);
     _setLeader(found);
-    console.log(`[LeaderTracker] Leader: ${currentLeader}` + (changed ? ' [NEW]' : ''));
-
     if (changed) {
+      linfo(`Leader: ${currentLeader} [NEW]`);
       // Replay any strokes that were queued during the leader-less window
       await replayQueue();
     }
   } catch {
     // AggregateError — no replica responded as Leader
     if (currentLeader !== null) {
-      console.warn('[LeaderTracker] No leader found — strokes will be queued');
+      lwarn('No leader found — strokes will be queued');
     }
     _setLeader(null);
   } finally {
@@ -179,8 +201,8 @@ function _enqueue(stroke) {
   if (strokeQueue.length >= MAX_QUEUE_SIZE) {
     // Drop the oldest entry to prevent unbounded memory growth
     const dropped = strokeQueue.shift();
-    console.warn(
-      `[LeaderTracker] Queue full (${MAX_QUEUE_SIZE}) — dropped oldest stroke` +
+    lwarn(
+      `Queue full (${MAX_QUEUE_SIZE}) — dropped oldest stroke` +
       ` (points=${dropped?.points?.length ?? '?'})`
     );
   }
@@ -199,15 +221,15 @@ async function replayQueue() {
     return;
   }
 
-  console.log(`[LeaderTracker] Replaying ${strokeQueue.length} queued stroke(s) to ${currentLeader}`);
+  linfo(`Replaying ${strokeQueue.length} queued stroke(s) to ${currentLeader}`);
 
   while (strokeQueue.length > 0 && currentLeader) {
     const item = strokeQueue[0]; // Peek — only shift on success or exhaustion
 
     if (item.retries >= MAX_REPLAY_RETRIES) {
       strokeQueue.shift();
-      console.warn(
-        `[LeaderTracker] Stroke exhausted ${MAX_REPLAY_RETRIES} retries — discarding` +
+      lwarn(
+        `Stroke exhausted ${MAX_REPLAY_RETRIES} retries — discarding` +
         ` (points=${item.stroke?.points?.length ?? '?'})`
       );
       continue;
@@ -224,7 +246,7 @@ async function replayQueue() {
 
       if (!res.data.success) {
         // The node we thought was leader rejected it — use hint or re-discover
-        console.warn(`[LeaderTracker] Replay rejected by ${currentLeader}: ${res.data.error}`);
+        lwarn(`Replay rejected by ${currentLeader}: ${res.data.error}`);
         const resolved = await _resolveLeaderFromHint(res.data.leader);
         if (!resolved) {
           // Could not find a new leader — stop draining, leave item in queue
@@ -236,9 +258,9 @@ async function replayQueue() {
       }
 
       strokeQueue.shift(); // Successfully delivered → remove from queue
-      console.log(`[LeaderTracker] Replayed queued stroke (index=${res.data.index})`);
+      linfo(`Replayed queued stroke (index=${res.data.index})`);
     } catch (err) {
-      console.warn(`[LeaderTracker] Replay failed (attempt ${item.retries}): ${err.message}`);
+      lwarn(`Replay failed (attempt ${item.retries}): ${err.message}`);
       _setLeader(null);
       await discoverLeader(); // Attempt to find a new leader
       if (!currentLeader) break; // Still no leader — stop replaying
@@ -248,7 +270,7 @@ async function replayQueue() {
   // Queue is fully drained (or we ran out of leader) — failover complete
   if (strokeQueue.length === 0) {
     _setFailoverActive(false);
-    console.log('[LeaderTracker] Queue drained — failover complete');
+    linfo('Queue drained — failover complete');
   }
 }
 
@@ -268,11 +290,11 @@ async function _resolveLeaderFromHint(hintLeaderId) {
       : REPLICAS.find(u => u.includes(hintLeaderId)) || null;
 
     if (hintUrl) {
-      console.log(`[LeaderTracker] Trying leader hint: ${hintUrl}`);
+      linfo(`Trying leader hint: ${hintUrl}`);
       const verified = await _verifyHint(hintUrl);
       if (verified) {
         _setLeader(verified);
-        console.log(`[LeaderTracker] Leader confirmed via hint: ${currentLeader}`);
+        linfo(`Leader confirmed via hint: ${currentLeader}`);
         return true;
       }
     }
@@ -309,7 +331,7 @@ async function _runFailoverRecovery(strokeToQueue) {
   // If another recovery is already in progress, just return —
   // the ongoing recovery will drain this stroke from the queue too.
   if (failoverLock) {
-    console.log('[LeaderTracker] Failover already in progress — stroke queued, recovery running');
+    linfo('Failover already in progress — stroke queued, recovery running');
     return;
   }
 
@@ -335,7 +357,7 @@ async function _runFailoverRecovery(strokeToQueue) {
  * (e.g. after a kill -9), the gateway detects it within POLL_INTERVAL_MS.
  */
 function start() {
-  console.log(`[LeaderTracker] Starting — replicas: ${REPLICAS.join(', ')}`);
+  linfo(`Starting — replicas: ${REPLICAS.join(', ')}`);
   discoverLeader(); // Initial discovery (async, non-blocking)
   pollTimer = setInterval(discoverLeader, POLL_INTERVAL_MS);
 }
@@ -359,32 +381,34 @@ function isFailoverInProgress() {
  * Forward a stroke to the current leader via POST /client-stroke.
  *
  * Behaviour:
- *  - No leader known         → queue stroke, trigger discovery (FR-GW-08)
+ *  - No leader known         → enqueue stroke + enter serialised failover recovery (FR-GW-08)
  *  - Leader reachable        → POST stroke, return result
  *  - Leader says "not leader"→ use leader hint to fast-path re-discovery (FR-GW-09)
  *  - Leader unreachable      → enter serialised failover recovery:
  *                              enqueue stroke, null leader, discover new leader,
  *                              replay queue once found — all within a single lock
  *                              so concurrent failures don't race each other
+ *
+ * [BUG-3 FIX] Case 1 previously used a fire-and-forget discoverLeader() wrapped
+ *  in .finally() to release failoverLock.  If a second stroke arrived in the window
+ *  between discoverLeader() resolving and .finally() executing, it would find
+ *  failoverLock===false and spawn a second concurrent discovery — causing a
+ *  double-replay race.  Now Case 1 routes through _runFailoverRecovery() which
+ *  uses the same serialised await path as Case 3.
  */
 async function forwardStroke(stroke) {
   // ── Case 1: No leader currently known (or failover already running) ─────────
   if (!currentLeader) {
-    console.warn('[LeaderTracker] No leader — queuing stroke');
-    _enqueue(stroke);
-    _setFailoverActive(true);
-    if (!failoverLock) {
-      // Kick off a fresh recovery attempt
-      failoverLock = true;
-      discoverLeader().finally(() => {
-        failoverLock = false;
-        if (strokeQueue.length === 0) _setFailoverActive(false);
-      });
-    }
+    lwarn('No leader — queuing stroke via serialised failover recovery');
+    // [BUG-3 FIX] Use the properly-awaited _runFailoverRecovery path instead of a
+    // fire-and-forget discoverLeader to prevent the double-discovery race condition.
+    _runFailoverRecovery(stroke).catch((err) => {
+      lerror(`Failover recovery threw unexpectedly: ${err.message}`);
+    });
     return { queued: true };
   }
 
-  // ── Case 2: Forward to known leader ────────────────────────────────────────
+  // ── Case 2: Forward to known leader ─────────────────────────────────────
   try {
     const res = await axios.post(
       `${currentLeader}/client-stroke`,
@@ -394,9 +418,7 @@ async function forwardStroke(stroke) {
 
     if (!res.data.success) {
       // Leader responded but it's no longer the leader (e.g. stepped down mid-term)
-      console.warn(
-        `[LeaderTracker] Leader rejected stroke: "${res.data.error}" — resolving via hint`
-      );
+      lwarn(`Leader rejected stroke: "${res.data.error}" — resolving via hint`);
       await _runFailoverRecovery(stroke);
       return { queued: true };
     }
@@ -404,10 +426,8 @@ async function forwardStroke(stroke) {
     return { success: true, index: res.data.index };
 
   } catch (err) {
-    // ── Case 3: Leader unreachable (timeout / network error) ─────────────────
-    console.error(
-      `[LeaderTracker] Leader unreachable (${err.message}) — entering serialised failover`
-    );
+    // ── Case 3: Leader unreachable (timeout / network error) ─────────────
+    lerror(`Leader unreachable (${err.message}) — entering serialised failover`);
     await _runFailoverRecovery(stroke);
     return { queued: true };
   }
