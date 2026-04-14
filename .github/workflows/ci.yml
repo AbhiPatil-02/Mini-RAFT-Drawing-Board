@@ -171,32 +171,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── Set up Docker BuildKit ───────────────────────────────────────────
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ── Cache Docker layers between runs ────────────────────────────────
-      - name: Cache Docker layers
-        uses: actions/cache@v4
-        with:
-          path: /tmp/.buildx-cache-${{ matrix.service }}
-          key: buildx-${{ matrix.service }}-${{ github.sha }}
-          restore-keys: |
-            buildx-${{ matrix.service }}-
-
-      # ── Build the image (no push) ────────────────────────────────────────
-      - name: Build ${{ matrix.service }} image
-        uses: docker/build-push-action@v5
-        with:
-          context: ${{ matrix.context }}
-          push: false
-          tags: mini-raft/${{ matrix.service }}:ci-${{ github.sha }}
-          cache-from: type=local,src=/tmp/.buildx-cache-${{ matrix.service }}
-          cache-to:   type=local,dest=/tmp/.buildx-cache-${{ matrix.service }}-new,mode=max
-
-      # ── Rotate cache (prevents unbounded cache growth) ───────────────────
-      - name: Rotate Docker layer cache
+      # ── Build the image (no push, no buildkit) ───────────────────────────
+      - name: Build ${{ matrix.service }} image (Classic Builder)
+        env:
+          DOCKER_BUILDKIT: "0"
         run: |
-          rm -rf /tmp/.buildx-cache-${{ matrix.service }}
-          mv /tmp/.buildx-cache-${{ matrix.service }}-new \
-             /tmp/.buildx-cache-${{ matrix.service }}
+          docker build -t mini-raft/${{ matrix.service }}:ci-${{ github.sha }} ${{ matrix.context }}
