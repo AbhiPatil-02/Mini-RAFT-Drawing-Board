@@ -482,9 +482,9 @@ describe('sendHeartbeats() — proactive sync-log trigger', () => {
   async function driveToLeader() {
     axiosMock.post.mockResolvedValue({ data: { term: 1, voteGranted: true, success: true } });
     raft.start();
-    // t=0 jitter fires becomeFollower(0) → sets election timer (500-800 ms)
-    // t=900 election fires → wins → becomeLeader → immediate sendHeartbeats
-    await jest.advanceTimersByTimeAsync(900);
+    // startup delay = 200 ms (replica1) → becomeFollower(0) → election timer (500–800 ms)
+    // worst case: 200 + 800 = 1000 ms; advance 1200 ms to guarantee election fires
+    await jest.advanceTimersByTimeAsync(1200);
     expect(raft.getStatus().state).toBe('Leader');
   }
 
@@ -640,9 +640,9 @@ describe('handleClientStroke() — leader path (election required)', () => {
 
     raft.start();
 
-    // 0 ms jitter fires immediately → becomeFollower(0) → sets election timer (500-800 ms)
-    // Advance 900 ms → election fires → async election + vote requests resolve
-    await jest.advanceTimersByTimeAsync(900);
+    // startup delay = 200 ms (replica1) → becomeFollower(0) → election timer (500–800 ms)
+    // worst case: 200 + 800 = 1000 ms; advance 1200 ms to guarantee election fires
+    await jest.advanceTimersByTimeAsync(1200);
   }
 
   test('becomes Leader after winning election', async () => {
@@ -744,7 +744,9 @@ describe('scalability quorum (4-node cluster)', () => {
     const log4  = raft4._getDefaultLog();
 
     raft4.start();
-    await jest.advanceTimersByTimeAsync(900);
+    // startup delay = 200 ms (replica1 idDigit=1) → becomeFollower(0) → election timer (500–800 ms)
+    // worst case: 200 + 800 = 1000 ms; advance 1200 ms to guarantee election fires
+    await jest.advanceTimersByTimeAsync(1200);
     expect(raft4.getStatus().state).toBe('Leader');
 
     return { raft4, log4, axios4 };

@@ -74,6 +74,14 @@ let electionTimer      = null;
 let heartbeatTimer     = null;
 let electionInProgress = false;
 
+/**
+ * [FIX-REJOIN-1] Timestamp of last valid heartbeat/AppendEntries received from
+ * a legitimate leader. Used to implement "leader stickiness": a node that
+ * recently heard from a leader will refuse to vote for a newcomer, preventing
+ * a restarted node from disrupting an active cluster.
+ */
+let lastLeaderContact = 0;  // epoch ms, 0 = never
+
 // ── Per-board state ───────────────────────────────────────────────────────────
 /**
  * boardLogs: Map<boardId, StrokeLog>
@@ -151,6 +159,23 @@ function randomElectionTimeout() {
 function resetElectionTimer() {
   clearTimeout(electionTimer);
   electionTimer = setTimeout(startElection, randomElectionTimeout());
+}
+
+/**
+ * [FIX-REJOIN-1] Record the current time as the last moment a valid leader
+ * message was received.  Called from handleHeartbeat and handleAppendEntries.
+ */
+function _touchLeaderContact() {
+  lastLeaderContact = Date.now();
+}
+
+/**
+ * [FIX-REJOIN-1] Returns true if we heard from a live leader within the
+ * minimum election timeout window.  During this window we should not grant
+ * votes to new candidates — the cluster already has a healthy leader.
+ */
+function _recentLeaderContact() {
+  return (Date.now() - lastLeaderContact) < config.ELECTION_TIMEOUT_MIN_MS;
 }
 
 function clearElectionTimer() {
@@ -341,6 +366,26 @@ async function sendHeartbeats() {
 function handleRequestVote(body) {
   const { term, candidateId, lastLogIndex, lastLogTerm } = body;
 
+  // [FIX-REJOIN-1] Leader stickiness: if we recently heard from a live leader,
+  // refuse to vote for anyone else — even if their term is higher.  This
+  // prevents a restarted node (which always starts at term 0 and immediately
+  // increments) from disrupting an active cluster by forcing incumbent nodes
+  // to call becomeFollower() and reset their votedFor.
+  //
+  // Exception: if the candidate's term is already known to us (term <= currentTerm
+  // with a stale votedFor) we still apply the normal grant rules, but we never
+  // step down to follow a stale-term candidate.
+  if (term > currentTerm && _recentLeaderContact()) {
+    warn(
+      `Ignoring RequestVote from ${candidateId} (term ${term} > ${currentTerm})` +
+      ` — heard from leader ${currentLeader} within minimum election timeout; ` +
+      `cluster is healthy, refusing to disrupt leader.`
+    );
+    // Reply with our current term so the requester learns the cluster is live;
+    // voteGranted=false keeps them from winning an unnecessary election.
+    return { term: currentTerm, voteGranted: false };
+  }
+
   if (term > currentTerm) {
     becomeFollower(term);
   }
@@ -364,7 +409,8 @@ function handleRequestVote(body) {
   } else {
     info(
       `✗ Denied vote for ${candidateId} in term ${term}` +
-      ` (votedFor=${votedFor}, logUpToDate=${logUpToDate})`
+      ` (votedFor=${votedFor}, logUpToDate=${logUpToDate})` +
+      ` [recentLeaderContact=${_recentLeaderContact()}]`
     );
   }
 
@@ -395,6 +441,7 @@ function handleHeartbeat(body) {
   }
 
   currentLeader = leaderId;
+  _touchLeaderContact(); // [FIX-REJOIN-1] record live-leader contact time
   resetElectionTimer();
 
   // Advance per-board commitIndex based on leader's knowledge
@@ -445,6 +492,7 @@ function handleAppendEntries(body) {
   }
 
   currentLeader = leaderId;
+  _touchLeaderContact(); // [FIX-REJOIN-1] record live-leader contact time
   resetElectionTimer();
 
   // 3. Log consistency check
@@ -724,10 +772,27 @@ function start() {
   info(`   Heartbeat   : every ${config.HEARTBEAT_INTERVAL_MS} ms`);
   info(`──────────────────────────────────────────────────`);
 
-  const idDigit = parseInt(config.REPLICA_ID.replace(/\D/g, ''), 10) || 1;
-  const jitter  = (idDigit - 1) * 50;
-  info(`Applying startup jitter: ${jitter} ms`);
-  setTimeout(() => becomeFollower(0), jitter);
+  // [FIX-REJOIN-2] Use a startup delay that is guaranteed to be LONGER than
+  // the heartbeat interval (150 ms) so an already-running leader has time to
+  // send at least one heartbeat before the election timer fires for the first
+  // time.  This ensures a restarted node learns the current term via the
+  // heartbeat and becomes a follower instead of disrupting the cluster with a
+  // spurious election.
+  //
+  // We stagger the per-replica delay so that if multiple nodes restart
+  // simultaneously (e.g. full cluster restart) they don't all hold elections
+  // at the same millisecond.
+  //
+  //   replica1 → 200 ms   (1-1)*200 = 0  + 200 base
+  //   replica2 → 400 ms   (2-1)*200 = 200 + 200 base
+  //   replica3 → 600 ms   (3-1)*200 = 400 + 200 base
+  //
+  // The base 200 ms >> heartbeat interval (150 ms), so a live leader is heard
+  // before the election timer ever fires.
+  const idDigit    = parseInt(config.REPLICA_ID.replace(/\D/g, ''), 10) || 1;
+  const startDelay = 200 + (idDigit - 1) * 200;  // was: (idDigit-1)*50
+  info(`Startup delay: ${startDelay} ms (heartbeat=${config.HEARTBEAT_INTERVAL_MS} ms — will receive heartbeat before first election)`);
+  setTimeout(() => becomeFollower(0), startDelay);
 }
 
 /**
